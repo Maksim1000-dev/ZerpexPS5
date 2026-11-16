@@ -261,10 +261,9 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
 }
 
 // ----------------------------------------------------------------------------
-// Путь SELF: анализ фазы 2.5 (энтропия + модули + бейдж)
+// Путь SELF: анализ фазы 2.5 + ПОПЫТКА запуска (фаза 7, шаг 1)
 // ----------------------------------------------------------------------------
-static void AnalyzeSelfReport(const std::wstring& path) {
-    zrx::analyze::SelfReport r = zrx::analyze::AnalyzeFile(path);
+static void AnalyzeSelfReport(const zrx::analyze::SelfReport& r) {
     if (!r.ok) {
         printf("  ОШИБКА анализа SELF: %s\n", r.error.c_str());
         return;
@@ -312,8 +311,45 @@ static void AnalyzeSelfReport(const std::wstring& path) {
     printf("\n  БЕЙДЖ: %s\n",
            r.open ? "SELF (данные открыты) -> путь фазы 3/4 (запуск без ключей)"
                   : "SELF (зашифрован) -> фаза 7 (нужны ключи сцены)");
-    printf("  ИТОГ SELF: анализ фазы 2.5 готов. Исполнение SELF — после фазы 4\n");
-    printf("  (нужен загрузчик: динамика, релокации, libc).\n");
+}
+
+// Фаза 7, шаг 1: попытка запуска SELF БЕЗ ключей.
+// SELF-контейнер = заголовок + таблица сегментов + payload. Если payload —
+// открытый ELF (домашние/расшифрованные дампы), его можно исполнять тем же
+// нативным путём, что и ELF (фаза 4). Зашифрованный retail — честная стена.
+static void TryRunSelf(const std::wstring& path, const zrx::analyze::SelfReport& r) {
+    if (!r.ok) return;
+
+    if (!r.nestedElf) {
+        printf("\n[3] Попытка запуска: НЕВОЗМОЖНА честно — открытого вложенного ELF нет.\n");
+        printf("    Payload зашифрован (retail): дешифровка = фаза 7, нужны ключи сцены\n");
+        printf("    (ключи живут только локально, в репо не попадут). Анализ выше — тоже результат.\n");
+        return;
+    }
+
+    printf("\n[3] Попытка запуска (фаза 7, шаг 1): вложенный ELF @0x%llX "
+           "(type=0x%04X, entry=0x%llX, OSABI=%u)\n\n",
+           (unsigned long long)r.elfOffset, (unsigned)r.elfType,
+           (unsigned long long)r.elfEntry, (unsigned)r.elfOsabi);
+    if (!r.open)
+        printf("  ! Сегменты выглядят зашифрованными — попытка будет честной,\n"
+               "    ожидаем крах: он покажет, каких syscall'ов не хватает.\n\n");
+
+    const std::vector<uint8_t> all = ReadAll(path);
+    if (all.size() <= r.elfOffset) {
+        printf("  Файл не прочитался или ELF за границей — запуска не будет\n");
+        return;
+    }
+    std::vector<uint8_t> data(all.begin() + (size_t)r.elfOffset, all.end());
+    if (data.size() < 64) {
+        printf("  Вложенный ELF слишком мал — запуска не будет\n");
+        return;
+    }
+
+    // Корень игры = папка с eboot (для /app0) — как у обычного ELF-пути.
+    g_ebootDir = fs::path(path).parent_path().wstring();
+    if (g_ebootDir.empty()) g_ebootDir = L".";
+    RunElfProgram(data);
 }
 
 // ----------------------------------------------------------------------------
@@ -450,7 +486,9 @@ static int RealMain() {
     if (isSelf) {
         printf("[1] Магия: 54 14 F5 EE -> SELF-контейнер PS5\n");
         printf("[2] Умный анализ (фаза 2.5):\n\n");
-        AnalyzeSelfReport(path);
+        const zrx::analyze::SelfReport rep = zrx::analyze::AnalyzeFile(path);
+        AnalyzeSelfReport(rep);
+        TryRunSelf(path, rep);   // фаза 7, шаг 1: запуск только если ELF открыт
     } else if (isElf) {
         printf("[1] Магия: 7F 45 4C 46 -> открытый ELF\n");
         printf("[2] Загрузка + релокации + нативный запуск (фазы 4-5):\n\n");
@@ -470,8 +508,9 @@ static int RealMain() {
     }
 
     Line();
-    printf("ZerpexPS5: фаза 5.0 (первый пиксель) + фаза 4 (исполнение/ФС/потоки) + фаза 2.5 (анализ).\n");
-    printf("Дальше: фаза 5.1 (PM4/шейдеры -> растеризация).\n");
+    printf("ZerpexPS5: фаза 5.2 (рендер из PM4: прокси-треугольник) + фаза 4 (исполнение) + фаза 2.5.\n");
+    printf("SELF: попытка запуска открытого вложенного ELF (фаза 7, шаг 1; retail — после дешифровки).\n");
+    printf("Дальше: фаза 5.3 (настоящая трансляция GCN-шейдеров).\n");
     return 0;
 }
 

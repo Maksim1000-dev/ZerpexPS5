@@ -660,7 +660,7 @@ static void DrawHeader(const ImVec2& disp) {
             st_text = "ELF — домашний, запуск готов (фаза 3)";
             st_col  = COL_GREEN;
         } else if (g.self_state == "self-open") {
-            st_text = "SELF — данные открыты, анализ ядром доступен";
+            st_text = "SELF — данные открыты, ядро попытается запустить";
             st_col  = COL_GREEN;
         } else {
             st_text = "SELF — зашифрован, ждём ключи сцены (фаза 7)";
@@ -991,9 +991,9 @@ static void DrawUI() {
             if (gsel.eboot == "elf")
                 ImGui::SetTooltip("Консоль ядра: разбор + НАТИВНОЕ исполнение\nс перехватом syscall (фаза 3)");
             else if (gsel.self_state == "self-open")
-                ImGui::SetTooltip("Консоль ядра: умный анализ SELF (энтропия,\nмодули, бейдж). Исполнение SELF — фаза 4");
+                ImGui::SetTooltip("Консоль ядра: анализ + попытка запуска открытого\nвложенного ELF (фаза 7, шаг 1)");
             else
-                ImGui::SetTooltip("Консоль ядра: анализ покажет шифрование сегментов\n(ритейл — ждём ключи сцены, фаза 7)");
+                ImGui::SetTooltip("Консоль ядра: анализ покажет шифрование сегментов\n(retail — исполнение после дешифровки, фаза 7)");
         }
     }
 
