@@ -197,6 +197,30 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
         return;
     }
 
+    // --- Фаза 7.1: базо-относительный ELF ------------------------------------
+    // PS5-игры (SCE_EXEC) держат все p_vaddr от нуля: реальный лоадер сам
+    // выбирает базу. Наш identity-маппинг не может жить по адресу 0, поэтому
+    // выбираем базу сами и прибавляем ко всем vaddr + entry. Абсолютные ELF
+    // (hello3/hello4, vaddr 0x400000) базу не получают — поведение прежнее.
+    uint64_t loadBase = 0;
+    {
+        uint64_t minV = ~0ull;
+        for (size_t idx : e.loadIdx) {
+            const zrx::ElfSegment& p = e.phdrs[idx];
+            if (p.memsz && p.vaddr < minV) minV = p.vaddr;
+        }
+        if (!e.loadIdx.empty() && minV == 0) {
+            loadBase = 0x400000;
+            for (zrx::ElfSegment& p : e.phdrs) {
+                if (p.type == zrx::PT_LOAD || p.vaddr != 0) p.vaddr += loadBase;
+            }
+            e.entry += loadBase;
+            printf("  [база] PS5 ELF базо-относительный (vaddr от нуля) — "
+                   "выбрана база 0x%llX, entry -> 0x%llX\n",
+                   (unsigned long long)loadBase, (unsigned long long)e.entry);
+        }
+    }
+
     printf("  Тип: %s | CPU: %s | entry=0x%llX | OSABI=%u\n",
            zrx::ElfTypeName(e.type), zrx::MachineName(e.machine),
            (unsigned long long)e.entry, (unsigned)e.eiOsabi);
@@ -228,6 +252,7 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
     // --- Фаза 4: релокации ДО исполнения (патч сканирует уже исправленный код),
     // корень игры для /app0, потом HLE/запуск ---
     zrx::dyn::AttachMemory(&mem);
+    zrx::dyn::SetLoadBase(loadBase);   // фаза 7.1: адреса динамики базо-относительные
     zrx::dyn::ResetStubs();
     zrx::dyn::ApplyRelocations(e);
 

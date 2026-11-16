@@ -59,6 +59,10 @@ struct Rela64 {
 
 static Memory* g_mem = nullptr;
 
+// Фаза 7.1: база загрузки для базо-относительных ELF (PS5-стиль, vaddr от 0).
+static uint64_t g_loadBase = 0;
+void SetLoadBase(uint64_t base) { g_loadBase = base; }
+
 void AttachMemory(Memory* mem) { g_mem = mem; }
 
 // --- Реестр заглушек --------------------------------------------------------
@@ -249,12 +253,12 @@ bool ApplyRelocations(const ElfImage& elf) {
         memcpy(&val, p + 8, 8);
         if (tag == 0) break;      // DT_NULL — конец
         switch (tag) {
-        case (int64_t)DT_HASH:     dtHash = val; break;
-        case (int64_t)DT_STRTAB:   dtStrtab = val; break;
-        case (int64_t)DT_SYMTAB:   dtSymtab = val; break;
-        case (int64_t)DT_RELA:     dtRela = val; break;
+        case (int64_t)DT_HASH:     dtHash   = val + g_loadBase; break;
+        case (int64_t)DT_STRTAB:   dtStrtab = val + g_loadBase; break;
+        case (int64_t)DT_SYMTAB:   dtSymtab = val + g_loadBase; break;
+        case (int64_t)DT_RELA:     dtRela   = val + g_loadBase; break;
         case (int64_t)DT_RELASZ:   dtRelasz = val; break;
-        case (int64_t)DT_JMPREL:   dtJmprel = val; break;
+        case (int64_t)DT_JMPREL:   dtJmprel = val + g_loadBase; break;
         case (int64_t)DT_PLTRELSZ: dtPltrelsz = val; break;
         case (int64_t)DT_SYMENT:   dtSyment = val; break;
         case (int64_t)DT_STRSZ:    dtStrsz = val; break;
@@ -320,15 +324,16 @@ bool ApplyRelocations(const ElfImage& elf) {
         for (const Rela64& r : v) {
             const uint32_t type = (uint32_t)(r.r_info & 0xFFFFFFFFu);
             const uint32_t symIdx = (uint32_t)(r.r_info >> 32);
+            const uint64_t place = r.r_offset + g_loadBase;   // куда писать
 
             switch (type) {
             case R_X86_64_RELATIVE:
-                if (GuestWriteU64(r.r_offset, (uint64_t)r.r_addend)) ++nRelative;
+                if (GuestWriteU64(place, (uint64_t)r.r_addend + g_loadBase)) ++nRelative;
                 else ++nBadPlace;
                 break;
 
             case R_X86_64_IRELATIVE:
-                if (GuestWriteU64(r.r_offset, (uint64_t)r.r_addend)) ++nIrelative;
+                if (GuestWriteU64(place, (uint64_t)r.r_addend + g_loadBase)) ++nIrelative;
                 else ++nBadPlace;
                 break;
 
@@ -342,14 +347,14 @@ bool ApplyRelocations(const ElfImage& elf) {
                 memcpy(&s, sp, 24);
                 const bool defined = (s.st_shndx != 0) && (s.st_value != 0);
                 if (defined) {
-                    const uint64_t val = s.st_value + (uint64_t)r.r_addend;
-                    if (GuestWriteU64(r.r_offset, val)) ++nResolved;
+                    const uint64_t val = s.st_value + g_loadBase + (uint64_t)r.r_addend;
+                    if (GuestWriteU64(place, val)) ++nResolved;
                     else ++nBadPlace;
                 } else {
                     char name[96];
                     GuestReadStr(dtStrtab + s.st_name, name, sizeof(name));
                     const uint64_t stub = InstallStub(name);
-                    if (stub && GuestWriteU64(r.r_offset, stub)) {
+                    if (stub && GuestWriteU64(place, stub)) {
                         ++nStubs;
                         if (firstUnresolved.size() < 24)
                             firstUnresolved.push_back(name);

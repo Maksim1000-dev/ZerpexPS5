@@ -23,6 +23,12 @@ namespace dyn {
 // Связывает модуль с памятью (нужно и для релокаций, и для страницы заглушек)
 void AttachMemory(Memory* mem);
 
+// База загрузки для базо-относительных ELF (фаза 7.1): PS5 ELF держит vaddr
+// от нуля, реальный лоадер выбирает базу. Зовётся ДО ApplyRelocations;
+// прибавляется ко всем адресам из динамики (DT_*, r_offset, st_value, addend
+// у RELATIVE/IRELATIVE). 0 = абсолютный ELF (hello3/hello4) — как раньше.
+void SetLoadBase(uint64_t base);
+
 // Сбрасывает реестр заглушек (перед новым прогоном)
 void ResetStubs();
 
