@@ -49,7 +49,7 @@ static const uint32_t kMaxPackets = 40;   // печатаем первые N п�
 static const int      kMaxDepth   = 2;    // глубина вложенных INDIRECT_BUFFER
 
 void DumpStream(const char* label, const uint32_t* d, uint32_t n,
-                int depth, ResolveFn resolve, void* user) {
+                int depth, ResolveFn resolve, void* user, Frame* frame) {
     if (!d || n == 0) {
         printf("[PM4] %s: пустой буфер\n", label);
         fflush(stdout);
@@ -115,6 +115,14 @@ void DumpStream(const char* label, const uint32_t* d, uint32_t n,
             ++printed;
         }
 
+        // Фаза 5.2: DRAW_INDEX_AUTO — счётчик вершин в payload[0].
+        // Пока это единственный источник «намерения нарисовать» — реальные
+        // шейдеры/состояние появятся в 5.3, сейчас честный прокси-рендер.
+        if (op == 0xB9 && cnt >= 1 && frame) {
+            frame->hasDraw   = true;
+            frame->drawCount = payload[0];
+        }
+
         // Вложенный командный буфер: [addr_lo, addr_hi, size_dwords|флаги]
         if ((op == 0x33 || op == 0x3F) && cnt >= 3 && depth < kMaxDepth) {
             const uint64_t base = ((uint64_t)payload[1] << 32) | payload[0];
@@ -124,7 +132,7 @@ void DumpStream(const char* label, const uint32_t* d, uint32_t n,
             if (resolve && sub) {
                 const uint32_t* sd = resolve(base, (uint64_t)sub * 4, user);
                 if (sd)
-                    DumpStream("вложенный IB", sd, sub, depth + 1, resolve, user);
+                    DumpStream("вложенный IB", sd, sub, depth + 1, resolve, user, frame);
                 else
                     printf("[PM4]     %s-> память не мапнута, вложенный не разбираю\n",
                            indent);

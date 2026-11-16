@@ -27,6 +27,16 @@ void* StagePtr(uint64_t* sizeOut);
 // bytes должен быть не больше размера staging.
 bool Present(uint32_t w, uint32_t h, uint64_t bytes);
 
+// --- Фаза 5.2: рендер из PM4 (прокси-треугольник) --------------------------
+// Гость прислал PM4 с DRAW_INDEX_AUTO, но GCN-шейдеров у нас пока нет
+// (это фаза 5.3). Честный прокси: рисуем треугольник (из первых вершин
+// "n" гостя — берём 3) прямо в оффскрин Vulkan'а, без CPU-копии кадра.
+// false = рисовать не удалось (отчитываемся в лог один раз).
+bool RenderPm4(uint32_t vertices);
+
+// Показ PM4-кадра: оффскрин (уже с треугольником) -> свапчейн -> present.
+bool PresentPm4(uint32_t w, uint32_t h);
+
 // Полная уборка: device, instance, окно, DLL.
 void Shutdown();
 

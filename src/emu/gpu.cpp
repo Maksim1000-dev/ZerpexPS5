@@ -67,6 +67,24 @@ struct RegBuffer {
 };
 static std::vector<RegBuffer> g_bufs;
 
+// --- Фаза 5.2: режим рендера из PM4 -----------------------------------------
+// После submit с DRAW_INDEX_AUTO первый флип показывает прокси-треугольник,
+// а дальше — этот же PM4-кадр, ПОКА гость не перепишет свои буферы
+// (обнаружение — FNV-1a 64 по содержимому). Тогда возвращаемся к CPU-копии.
+static bool     g_pm4Mode    = false;   // флипы показывают PM4-кадр
+static bool     g_pm4Pending = false;   // в последнем submit был DRAW
+static uint32_t g_pm4Verts   = 0;       // вершин в последнем DRAW
+static std::vector<uint64_t> g_bufHash; // базовые хэши буферов (на 1-м PM4-флипе)
+
+static uint64_t BufHash(const uint8_t* p, uint64_t n) {
+    uint64_t h = 0xCBF29CE484222325ull;   // FNV-1a 64
+    for (uint64_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
 // --- sceVideoOut* -----------------------------------------------------------
 static int64_t VideoOutOpen(const uint64_t args[8]) {
     ++g_opens;
@@ -158,6 +176,7 @@ static int64_t VideoOutRegisterBuffers(const uint64_t args[8]) {
         printf("[GPU]     буфер[%u] guest 0x%llX (%llu байт)\n",
                i, (unsigned long long)ga, (unsigned long long)bytes);
     }
+    g_bufHash.assign(g_bufs.size(), 0);   // базы заполнятся на 1-м PM4-флипе
     fflush(stdout);
 
     if (!gpu_vk::Prepare(width, height, bytes)) {
@@ -193,6 +212,43 @@ static int64_t VideoOutSubmitFlip(const uint64_t args[8]) {
             fflush(stdout);
         }
         return 0;
+    }
+
+    // --- Фаза 5.2: рендер из PM4 --------------------------------------------
+    // Рисуем и/или показываем PM4-кадр, пока содержимое буфера не изменилось.
+    const uint64_t h = BufHash(src, b.bytes);
+    uint64_t& base = g_bufHash[(size_t)bufIndex];
+
+    if (g_pm4Mode) {
+        if (base != 0 && h != base) {
+            // Гость переписал буфер своими руками — честно возвращаемся к CPU-копии.
+            printf("[GPU]   PM4: буфер #%lld переписан гостем — возврат к CPU-копии\n",
+                   bufIndex);
+            fflush(stdout);
+            g_pm4Mode = false;
+            base = 0;
+        } else if (gpu_vk::PresentPm4(b.width, b.height)) {
+            return 0;   // PM4-кадр показан
+        }
+        // PresentPm4 не удался — упадём ниже на CPU-путь (он сам отчитается)
+    } else if (g_pm4Pending) {
+        // Первый флип после submit с DRAW: рисуем прокси и запоминаем базы.
+        g_pm4Pending = false;
+        if (gpu_vk::RenderPm4(g_pm4Verts)) {
+            if (gpu_vk::PresentPm4(b.width, b.height)) {
+                g_pm4Mode = true;
+                base = h;
+                for (size_t i = 0; i < g_bufs.size(); ++i) {
+                    const uint8_t* p = g_mem->Ptr(g_bufs[i].guestAddr);
+                    g_bufHash[i] = p ? BufHash(p, g_bufs[i].bytes) : 0;
+                }
+                printf("[GPU]   PM4: режим включён — флипы показывают PM4-кадр, "
+                       "пока гость не перепишет буферы\n");
+                fflush(stdout);
+                return 0;
+            }
+        }
+        // Не удалось — CPU-путь продолжит как раньше, режим не включаем.
     }
 
     uint64_t stageSize = 0;
@@ -245,8 +301,10 @@ static const uint32_t* Pm4Resolve(uint64_t addr, uint64_t bytes, void*) {
     return g_mem ? reinterpret_cast<const uint32_t*>(g_mem->Ptr(addr)) : nullptr;
 }
 
-// Разобрать и напечатать один командный буфер (фаза 5.1).
-static void Pm4DumpOne(uint32_t idx, uint64_t guestAddr, uint64_t bytes) {
+// Разобрать и напечатать один командный буфер (фаза 5.1/5.2).
+// frame (если не nullptr) — сводка для режима рендера из PM4.
+static void Pm4DumpOne(uint32_t idx, uint64_t guestAddr, uint64_t bytes,
+                       pm4::Frame* frame) {
     printf("[GPU]     буфер[%u]: guest 0x%llX, %llu байт\n", idx,
            (unsigned long long)guestAddr, (unsigned long long)bytes);
     if (!bytes) return;
@@ -259,7 +317,16 @@ static void Pm4DumpOne(uint32_t idx, uint64_t guestAddr, uint64_t bytes) {
         printf("[GPU]     буфер[%u]: память не мапнута — разбора нет\n", idx);
         return;
     }
-    pm4::DumpStream("командный буфер", d, (uint32_t)(bytes / 4), 0, &Pm4Resolve, nullptr);
+    pm4::DumpStream("командный буфер", d, (uint32_t)(bytes / 4), 0,
+                    &Pm4Resolve, nullptr, frame);
+}
+
+// Суммарная сводка всех буферов submit'а (что парсер увидел).
+static void Pm4PrintFrame(const pm4::Frame& f) {
+    if (f.hasDraw)
+        printf("[GPU]     PM4-сводка: DRAW есть, вершин (последний) %u\n", f.drawCount);
+    else
+        printf("[GPU]     PM4-сводка: DRAW не было\n");
 }
 
 static int64_t GnmSubmitCommandBuffers(const uint64_t args[8]) {
@@ -271,6 +338,7 @@ static int64_t GnmSubmitCommandBuffers(const uint64_t args[8]) {
     const uint64_t sizesP = args[3];
     printf("[GPU]   gnmSubmitCommandBuffers: queue=%u, буферов %u (фаза 5.1: разбор PM4)\n",
            queue, n);
+    pm4::Frame frame;
     if (n && n <= 8 && cmdsP && sizesP) {
         for (uint32_t b = 0; b < n; ++b) {
             const uint8_t* ap = g_mem ? g_mem->Ptr(cmdsP + b * 8)  : nullptr;
@@ -283,10 +351,16 @@ static int64_t GnmSubmitCommandBuffers(const uint64_t args[8]) {
             uint32_t bytes = 0;
             memcpy(&addr, ap, 8);
             memcpy(&bytes, sp, 4);
-            Pm4DumpOne(b, addr, bytes);
+            Pm4DumpOne(b, addr, bytes, &frame);
         }
     } else {
         printf("[GPU]     count=%u или указатели 0 — разбора нет\n", n);
+    }
+    Pm4PrintFrame(frame);
+    if (frame.hasDraw && frame.drawCount) {
+        // Кэш-линия в байтах для прокси-рендера не важна: рисуем свою геометрию.
+        g_pm4Pending = true;
+        g_pm4Verts   = frame.drawCount;
     }
     fflush(stdout);
     return 0;
@@ -302,6 +376,7 @@ static int64_t GnmSubmitAndFlip(const uint64_t args[8]) {
     printf("[GPU]   gnmSubmitAndFlipCommandBuffers: queue=%u, буферов %u, "
            "flipMode=%llu flipArg=%llu (фаза 5.1: разбор PM4)\n",
            queue, n, (unsigned long long)args[4], (unsigned long long)args[5]);
+    pm4::Frame frame;
     if (n && n <= 8 && cmdsP && sizesP) {
         for (uint32_t b = 0; b < n; ++b) {
             const uint8_t* ap = g_mem ? g_mem->Ptr(cmdsP + b * 8)  : nullptr;
@@ -314,10 +389,15 @@ static int64_t GnmSubmitAndFlip(const uint64_t args[8]) {
             uint32_t bytes = 0;
             memcpy(&addr, ap, 8);
             memcpy(&bytes, sp, 4);
-            Pm4DumpOne(b, addr, bytes);
+            Pm4DumpOne(b, addr, bytes, &frame);
         }
     } else {
         printf("[GPU]     count=%u или указатели 0 — разбора нет\n", n);
+    }
+    Pm4PrintFrame(frame);
+    if (frame.hasDraw && frame.drawCount) {
+        g_pm4Pending = true;
+        g_pm4Verts   = frame.drawCount;
     }
     fflush(stdout);
     return 0;
@@ -380,6 +460,9 @@ void PrintRunSummary() {
     }
     printf("[GPU]   всего: %d вызовов (open=%d, register=%d, флипов=%d)\n",
            total, g_opens, g_regs, g_flips);
+    printf("[GPU]   PM4-рендер: %s\n",
+           g_pm4Mode ? "прокси-треугольник показывался (фаза 5.2)"
+                     : "не активирован (CPU-копия кадра, как в 5.0)");
 }
 
 void Shutdown() { gpu_vk::Shutdown(); }

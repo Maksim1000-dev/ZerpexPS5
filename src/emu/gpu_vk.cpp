@@ -51,7 +51,12 @@ static std::vector<VkImageView> g_swView;
 
 static VkImage         g_off       = VK_NULL_HANDLE;
 static VkDeviceMemory  g_offMem    = VK_NULL_HANDLE;
-static bool            g_offIsDst  = false;    // лейаут оффскрина: TRANSFER_DST?
+static VkImageView     g_offView   = VK_NULL_HANDLE;
+static VkFramebuffer   g_offFb     = VK_NULL_HANDLE;
+// Фактический лейаут оффскрина между кадрами (инвариант: TRANSFER_SRC,
+// и CPU-путь, и PM4-путь завершают кадр именно в нём).
+enum class OffLayout { Undefined, TransferDst, TransferSrc };
+static OffLayout       g_offLayout = OffLayout::Undefined;
 static uint32_t        g_offW = 0, g_offH = 0;
 
 static VkBuffer        g_stage     = VK_NULL_HANDLE;
@@ -63,6 +68,20 @@ static VkCommandPool   g_cmdPool   = VK_NULL_HANDLE;
 static VkCommandBuffer g_cmd       = VK_NULL_HANDLE;
 static VkSemaphore     g_semAcq    = VK_NULL_HANDLE;
 static VkSemaphore     g_semDone   = VK_NULL_HANDLE;
+
+// --- Фаза 5.2: прокси-рендер из PM4 (без компилятора шейдеров) ---------------
+// SPIR-V собран вручную (опкоды сверены с грамматикой Khronos). Геометрия и
+// цвета — в хост-вершинном буфере; guest-шейдеров пока нет (фаза 5.3).
+static VkShaderModule        g_pmVs      = VK_NULL_HANDLE;
+static VkShaderModule        g_pmFs      = VK_NULL_HANDLE;
+static VkRenderPass          g_pmPass    = VK_NULL_HANDLE;
+static VkPipelineLayout      g_pmLayout  = VK_NULL_HANDLE;
+static VkPipeline            g_pmPipe    = VK_NULL_HANDLE;
+static VkBuffer              g_pmVb      = VK_NULL_HANDLE;
+static VkDeviceMemory        g_pmVbMem   = VK_NULL_HANDLE;
+static void*                 g_pmVbMap   = nullptr;
+static bool                  g_pmReady   = false;
+static bool                  g_pmFailed  = false;   // один честный отчёт об ошибке
 
 static HWND  g_hwnd       = nullptr;
 static bool  g_winClosed  = false;
@@ -120,6 +139,24 @@ static PFN_vkQueuePresentKHR                   pPresent;
 static PFN_vkAcquireNextImageKHR               pAcquire;
 static PFN_vkQueueWaitIdle                     pQueueIdle;
 static PFN_vkDeviceWaitIdle                    pDevIdle;
+// Фаза 5.2: рендер из PM4 (шейдеры, пайплайн, отрисовка).
+static PFN_vkCreateShaderModule                pCreateShader;
+static PFN_vkDestroyShaderModule               pDestroyShader;
+static PFN_vkCreateRenderPass                  pCreatePass;
+static PFN_vkDestroyRenderPass                 pDestroyPass;
+static PFN_vkCreateFramebuffer                 pCreateFb;
+static PFN_vkDestroyFramebuffer                pDestroyFb;
+static PFN_vkCreatePipelineLayout              pCreatePipeLayout;
+static PFN_vkDestroyPipelineLayout             pDestroyPipeLayout;
+static PFN_vkCreateGraphicsPipelines           pCreatePipelines;
+static PFN_vkDestroyPipeline                   pDestroyPipeline;
+static PFN_vkCmdBeginRenderPass                pCmdBeginPass;
+static PFN_vkCmdEndRenderPass                  pCmdEndPass;
+static PFN_vkCmdBindPipeline                   pCmdBindPipe;
+static PFN_vkCmdDraw                           pCmdDraw;
+static PFN_vkCmdSetViewport                    pCmdSetViewport;
+static PFN_vkCmdSetScissor                     pCmdSetScissor;
+static PFN_vkCmdBindVertexBuffers              pCmdBindVb;
 
 // Загрузка функций Vulkan. name — ГОЛЫЙ идентификатор (без кавычек):
 // строку для vkGet*ProcAddr и для печати даёт #name, а PFN_##name
@@ -395,6 +432,24 @@ static bool InitSurfaceDevice() {
     LOAD_D(pAcquire,          vkAcquireNextImageKHR);
     LOAD_D(pQueueIdle,        vkQueueWaitIdle);
     LOAD_D(pDevIdle,          vkDeviceWaitIdle);
+    // Фаза 5.2: прокси-рендер из PM4.
+    LOAD_D(pCreateShader,     vkCreateShaderModule);
+    LOAD_D(pDestroyShader,    vkDestroyShaderModule);
+    LOAD_D(pCreatePass,       vkCreateRenderPass);
+    LOAD_D(pDestroyPass,      vkDestroyRenderPass);
+    LOAD_D(pCreateFb,         vkCreateFramebuffer);
+    LOAD_D(pDestroyFb,        vkDestroyFramebuffer);
+    LOAD_D(pCreatePipeLayout, vkCreatePipelineLayout);
+    LOAD_D(pDestroyPipeLayout,vkDestroyPipelineLayout);
+    LOAD_D(pCreatePipelines,  vkCreateGraphicsPipelines);
+    LOAD_D(pDestroyPipeline,  vkDestroyPipeline);
+    LOAD_D(pCmdBeginPass,     vkCmdBeginRenderPass);
+    LOAD_D(pCmdEndPass,       vkCmdEndRenderPass);
+    LOAD_D(pCmdBindPipe,      vkCmdBindPipeline);
+    LOAD_D(pCmdDraw,          vkCmdDraw);
+    LOAD_D(pCmdSetViewport,   vkCmdSetViewport);
+    LOAD_D(pCmdSetScissor,    vkCmdSetScissor);
+    LOAD_D(pCmdBindVb,        vkCmdBindVertexBuffers);
 
     pGetQueue(g_dev, g_qFam, 0, &g_queue);
     printf("[GPU] шаг: очередь %u получена\n", g_qFam); fflush(stdout);
@@ -520,14 +575,18 @@ static bool RecreateSwapchain() {
 }
 
 // --- Оффскрин + staging -------------------------------------------------------
+static bool EnsurePm4Fb();   // определён в блоке фазы 5.2 (ниже)
+
 static void DestroyFrame() {
     g_stageMap = nullptr;   // vkFreeMemory неявно снимает мап
     if (g_stage)    { pDestroyBuffer(g_dev, g_stage, nullptr); g_stage = VK_NULL_HANDLE; }
     if (g_stageMem) { pFreeMem(g_dev, g_stageMem, nullptr); g_stageMem = VK_NULL_HANDLE; }
+    if (g_offFb)    { pDestroyFb(g_dev, g_offFb, nullptr); g_offFb = VK_NULL_HANDLE; }
+    if (g_offView)  { pDestroyView(g_dev, g_offView, nullptr); g_offView = VK_NULL_HANDLE; }
     if (g_off)      { pDestroyImage(g_dev, g_off, nullptr); g_off = VK_NULL_HANDLE; }
     if (g_offMem)   { pFreeMem(g_dev, g_offMem, nullptr); g_offMem = VK_NULL_HANDLE; }
     g_stageSize = 0;
-    g_offIsDst = false;
+    g_offLayout = OffLayout::Undefined;
 }
 
 static bool CreateFrame(uint32_t w, uint32_t h, uint64_t frameBytes) {
@@ -535,7 +594,8 @@ static bool CreateFrame(uint32_t w, uint32_t h, uint64_t frameBytes) {
     g_offW = w;
     g_offH = h;
 
-    // Оффскрин: принимаем копию из буфера и отдаём её в свапчейн.
+    // Оффскрин: принимаем копию из буфера, отдаём её в свапчейн И (5.2)
+    // принимаем рендер из PM4 — поэтому COLOR_ATTACHMENT_BIT обязателен.
     VkImageCreateInfo ici { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -544,7 +604,9 @@ static bool CreateFrame(uint32_t w, uint32_t h, uint64_t frameBytes) {
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+              | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     printf("[GPU] шаг: offscreen image %ux%u\n", w, h); fflush(stdout);
     if (pCreateImage(g_dev, &ici, nullptr, &g_off) != VK_SUCCESS) {
@@ -558,6 +620,18 @@ static bool CreateFrame(uint32_t w, uint32_t h, uint64_t frameBytes) {
     if (!AllocFor(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &g_offMem)) return false;
     if (pBindImage(g_dev, g_off, g_offMem, 0) != VK_SUCCESS) return false;
     printf("[GPU] шаг: offscreen память + bind ок\n"); fflush(stdout);
+
+    // View под фреймбуфер PM4-рендера (нужен и CPU-пути — он копирует по image).
+    VkImageViewCreateInfo vci { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = g_off;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_B8G8R8A8_UNORM;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (pCreateView(g_dev, &vci, nullptr, &g_offView) != VK_SUCCESS) return false;
+    g_offLayout = OffLayout::Undefined;
+    if (g_pmReady && !EnsurePm4Fb()) return false;
 
     // Staging: хост-память, gpu.cpp пишет туда кадр гостя напрямую.
     const uint64_t need = frameBytes > (uint64_t)w * h * 4
@@ -598,6 +672,370 @@ static void Barrier(VkCommandBuffer cb, VkImage img,
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
     pCmdBarrier(cb, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// --- Фаза 5.2: прокси-рендер из PM4 ------------------------------------------
+// Компилятора GLSL->SPIR-V у нас нет, поэтому шейдеры собраны ВРУЧНУЮ.
+// Каждый опкод и константа сверены с официальной грамматикой SPIR-V
+// (spirv.core.grammar.json) и spirv.h — они согласны. Шейдеры БЕЗ арифметики:
+// VS протаскивает два vec4-атрибута (позиция/цвет) из вершинного буфера,
+// FS протаскивает вход в выход. Геометрия и цвета — на нашей стороне,
+// потому что guest-шейдеров ещё нет (фаза 5.3 по RDNA2-доке).
+
+// Опкоды (проверено): Capability=17, MemoryModel=14, EntryPoint=15 (интерфейс —
+// IdRef* БЕЗ слова-счётчика), ExecutionMode=16, TypeVoid=19, TypeFloat=22,
+// TypeVector=23, TypePointer=32, TypeFunction=33, Constant=43, Function=54,
+// FunctionEnd=56, Variable=59, Load=61, Store=62, Decorate=71, Label=248,
+// Return=253. StorageClass: Input=1, Output=3. Decoration: Location=30,
+// BuiltIn=11 (Position=0). ExecutionMode OriginUpperLeft=7.
+static const uint32_t kVsSpirv[] = {
+    0x07230203, // магия SPIR-V
+    0x00010000, // версия 1.0
+    0,          // генератор
+    15,         // bound (id 1..13)
+    0,          // схема
+    0x00010011, 1,                    // OpCapability Shader
+    0x0003000E, 0, 1,                 // OpMemoryModel Logical GLSL450
+    0x0009000F, 0, 11, 0x6E69616D, 0, // OpEntryPoint Vertex "main", интерфейс
+    5, 6, 7, 8,                       //   (vars: pos, col, outColor, Position)
+    0x00040047, 5, 30, 0,             // OpDecorate 5 Location 0 (позиция)
+    0x00040047, 6, 30, 1,             // OpDecorate 6 Location 1 (цвет)
+    0x00040047, 7, 30, 0,             // OpDecorate 7 Location 0 (выход)
+    0x00040047, 8, 11, 0,             // OpDecorate 8 BuiltIn Position
+    0x00030016, 1, 32,                // OpTypeFloat f32 -> %1
+    0x00040017, 2, 1, 4,              // OpTypeVector vec4 -> %2
+    0x00040020, 3, 1, 2,              // OpTypePointer Input vec4 -> %3
+    0x00040020, 4, 3, 2,              // OpTypePointer Output vec4 -> %4
+    0x00020013, 9,                    // OpTypeVoid -> %9
+    0x00040021, 10, 9,                // OpTypeFunction void->void -> %10
+    0x0004003B, 3, 5, 1,              // OpVariable %5 (Input,  Location 0)
+    0x0004003B, 3, 6, 1,              // OpVariable %6 (Input,  Location 1)
+    0x0004003B, 4, 7, 3,              // OpVariable %7 (Output, Location 0)
+    0x0004003B, 4, 8, 3,              // OpVariable %8 (Output, BuiltIn Pos)
+    0x00050036, 9, 0, 10,             // OpFunction void %9 (тип %10)
+    0x000200F8, 11,                   // OpLabel %11
+    0x0004003D, 2, 12, 5,             // OpLoad %12 = %5 (позиция)
+    0x0004003D, 2, 13, 6,             // OpLoad %13 = %6 (цвет)
+    0x0003003E, 8, 12,                // OpStore Position <- %12
+    0x0003003E, 7, 13,                // OpStore outColor <- %13
+    0x000100FD,                       // OpReturn
+    0x00010038,                       // OpFunctionEnd
+};
+
+static const uint32_t kFsSpirv[] = {
+    0x07230203,
+    0x00010000,
+    0,
+    12,         // bound (id 1..11)
+    0,
+    0x00010011, 1,                    // OpCapability Shader
+    0x0003000E, 0, 1,                 // OpMemoryModel Logical GLSL450
+    0x0007000F, 4, 9, 0x6E69616D, 0,  // OpEntryPoint Fragment "main", интерфейс
+    5, 6,                             //   (vars: inColor, outColor)
+    0x00030010, 9, 7,                 // OpExecutionMode OriginUpperLeft
+    0x00040047, 5, 30, 0,             // OpDecorate 5 Location 0 (вход)
+    0x00040047, 6, 30, 0,             // OpDecorate 6 Location 0 (выход)
+    0x00030016, 1, 32,                // OpTypeFloat f32
+    0x00040017, 2, 1, 4,              // OpTypeVector vec4
+    0x00040020, 3, 1, 2,              // OpTypePointer Input vec4
+    0x00040020, 4, 3, 2,              // OpTypePointer Output vec4
+    0x00020013, 7,                    // OpTypeVoid
+    0x00040021, 8, 7,                 // OpTypeFunction void->void
+    0x0004003B, 3, 5, 1,              // OpVariable %5 (Input,  Location 0)
+    0x0004003B, 4, 6, 3,              // OpVariable %6 (Output, Location 0)
+    0x00050036, 7, 0, 8,              // OpFunction void %9
+    0x000200F8, 9,                    // OpLabel %10
+    0x0004003D, 2, 11, 5,             // OpLoad %11 = %5
+    0x0003003E, 6, 11,                // OpStore outColor <- %11
+    0x000100FD,                       // OpReturn
+    0x00010038,                       // OpFunctionEnd
+};
+
+// Треугольник-прокси: 3 вершины, stride 32 байта (два vec4: позиция, цвет).
+static const float kProxyTri[24] = {
+    // позиция (clip space)      цвет (r,g,b,a)
+    -0.7f, -0.7f, 0.0f, 1.0f,    1.0f, 0.3f, 0.3f, 1.0f,   // низ-лево (красн)
+     0.7f, -0.7f, 0.0f, 1.0f,    0.3f, 1.0f, 0.3f, 1.0f,   // низ-право (зелён)
+     0.0f,  0.8f, 0.0f, 1.0f,    0.3f, 0.3f, 1.0f, 1.0f,   // верх (синий)
+};
+
+static bool InitPm4Pipeline() {
+    if (g_pmReady) return true;
+    if (g_pmFailed) return false;
+    if (!g_dev) { g_pmFailed = true; return false; }
+
+    printf("[GPU] шаг: PM4-пайплайн (прокси-треугольник) — сборка\n"); fflush(stdout);
+
+    VkShaderModuleCreateInfo sci { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    sci.pCode    = kVsSpirv;
+    sci.codeSize = sizeof(kVsSpirv);
+    if (pCreateShader(g_dev, &sci, nullptr, &g_pmVs) != VK_SUCCESS) {
+        printf("[GPU]   SPIR-V вершинного шейдера отклонён драйвером\n");
+        fflush(stdout);
+        g_pmFailed = true; return false;
+    }
+    sci.pCode    = kFsSpirv;
+    sci.codeSize = sizeof(kFsSpirv);
+    if (pCreateShader(g_dev, &sci, nullptr, &g_pmFs) != VK_SUCCESS) {
+        printf("[GPU]   SPIR-V фрагментного шейдера отклонён драйвером\n");
+        fflush(stdout);
+        g_pmFailed = true; return false;
+    }
+
+    // Пустой layout: пока никаких констант/дескрипторов (5.3 добавит).
+    VkPipelineLayoutCreateInfo plci { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    if (pCreatePipeLayout(g_dev, &plci, nullptr, &g_pmLayout) != VK_SUCCESS) {
+        g_pmFailed = true; return false;
+    }
+
+    // Рендер-пасс: очищает оффскрин тёмно-синим, отдаёт его в TRANSFER_SRC.
+    VkAttachmentDescription att {};
+    att.format         = VK_FORMAT_B8G8R8A8_UNORM;
+    att.samples        = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout    = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    VkAttachmentReference aref { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub {};
+    sub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount    = 1;
+    sub.pColorAttachments       = &aref;
+
+    // Явная зависимость: запись цвета -> чтение трансфером (копия в свапчейн).
+    VkSubpassDependency deps[2] {};
+    deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].dstSubpass    = 0;
+    deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass    = 0;
+    deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[1].dstStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkRenderPassCreateInfo rpci { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    rpci.attachmentCount = 1;
+    rpci.pAttachments    = &att;
+    rpci.subpassCount    = 1;
+    rpci.pSubpasses      = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies   = deps;
+    if (pCreatePass(g_dev, &rpci, nullptr, &g_pmPass) != VK_SUCCESS) {
+        g_pmFailed = true; return false;
+    }
+
+    // Графический пайплайн: TRIANGLE_LIST, без отсечения, динамические
+    // viewport/scissor, смешивания нет, глубины нет (пустой указатель = нет).
+    VkVertexInputBindingDescription bind {};
+    bind.binding   = 0;
+    bind.stride    = 32;
+    bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attrs[2] {};
+    attrs[0].location = 0; attrs[0].binding = 0;
+    attrs[0].format   = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[0].offset = 0;
+    attrs[1].location = 1; attrs[1].binding = 1;
+    attrs[1].format   = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[1].offset = 16;
+
+    VkPipelineVertexInputStateCreateInfo vi {
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    vi.vertexBindingDescriptionCount   = 1;
+    vi.pVertexBindingDescriptions      = &bind;
+    vi.vertexAttributeDescriptionCount = 2;
+    vi.pVertexAttributeDescriptions    = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia {
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp {
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vp.viewportCount = 1;
+    vp.scissorCount  = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs {
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms {
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba {};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb {
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1;
+    cb.pAttachments    = &cba;
+
+    VkDynamicState dyns[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dyn {
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates    = dyns;
+
+    VkPipelineShaderStageCreateInfo stages[2] {};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = g_pmVs;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = g_pmFs;
+    stages[1].pName  = "main";
+
+    VkGraphicsPipelineCreateInfo pci { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    pci.stageCount          = 2;
+    pci.pStages             = stages;
+    pci.pVertexInputState   = &vi;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState      = &vp;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState   = &ms;
+    pci.pDepthStencilState  = nullptr;   // глубинного вложения нет
+    pci.pColorBlendState    = &cb;
+    pci.pDynamicState       = &dyn;
+    pci.layout              = g_pmLayout;
+    pci.renderPass          = g_pmPass;
+    pci.subpass             = 0;
+    if (pCreatePipelines(g_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pmPipe)
+            != VK_SUCCESS) {
+        printf("[GPU]   vkCreateGraphicsPipelines не удался\n");
+        fflush(stdout);
+        g_pmFailed = true; return false;
+    }
+
+    // Вершинный буфер 96 байт: хост-память, пишем треугольник один раз.
+    VkBufferCreateInfo bci { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size  = sizeof(kProxyTri);
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (pCreateBuffer(g_dev, &bci, nullptr, &g_pmVb) != VK_SUCCESS) {
+        g_pmFailed = true; return false;
+    }
+    VkMemoryRequirements rq;
+    pBufReqs(g_dev, g_pmVb, &rq);
+    if (!AllocFor(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                     | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &g_pmVbMem)) {
+        g_pmFailed = true; return false;
+    }
+    if (pBindBuffer(g_dev, g_pmVb, g_pmVbMem, 0) != VK_SUCCESS) {
+        g_pmFailed = true; return false;
+    }
+    if (pMapMem(g_dev, g_pmVbMem, 0, VK_WHOLE_SIZE, 0, &g_pmVbMap) != VK_SUCCESS) {
+        g_pmFailed = true; return false;
+    }
+    memcpy(g_pmVbMap, kProxyTri, sizeof(kProxyTri));
+
+    EnsurePm4Fb();
+    g_pmReady = true;
+    printf("[GPU] шаг: PM4-пайплайн ок (шейдеров гостя нет — прокси, это фаза 5.3)\n");
+    fflush(stdout);
+    return true;
+}
+
+// Фреймбуфер под текущий оффскрин. Создаётся при создании кадра (если пайплайн
+// уже жив) или лениво здесь после первой инициализации пайплайна.
+static bool EnsurePm4Fb() {
+    if (g_offFb || !g_offView || !g_pmPass) return g_offFb != VK_NULL_HANDLE;
+    VkFramebufferCreateInfo fci { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    fci.renderPass      = g_pmPass;
+    fci.attachmentCount = 1;
+    fci.pAttachments    = &g_offView;
+    fci.width  = g_offW;
+    fci.height = g_offH;
+    fci.layers = 1;
+    if (pCreateFb(g_dev, &fci, nullptr, &g_offFb) != VK_SUCCESS) {
+        printf("[GPU] vkCreateFramebuffer (оффскрин) не удался\n");
+        fflush(stdout);
+        return false;
+    }
+    return true;
+}
+
+// Отрисовка PM4-кадра: очистка + прокси-треугольник в оффскрин.
+// Инвариант лейаута соблюдён: после render pass оффскрин в TRANSFER_SRC.
+bool RenderPm4(uint32_t vertices) {
+    if (g_winClosed || g_noDevice || !g_dev) return false;
+    if (!g_pmReady && !InitPm4Pipeline()) return false;
+    if (!EnsurePm4Fb()) return false;
+
+    PumpMessages();
+    if (g_winClosed) return false;
+
+    VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pResetCmd(g_cmd, 0);
+    if (pBeginCmd(g_cmd, &bi) != VK_SUCCESS) return false;
+
+    VkClearValue clear;
+    clear.color = { { 0.02f, 0.02f, 0.06f, 1.0f } };
+    VkRenderPassBeginInfo rbi { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rbi.renderPass      = g_pmPass;
+    rbi.framebuffer     = g_offFb;
+    rbi.renderArea.extent = { g_offW, g_offH };
+    rbi.clearValueCount = 1;
+    rbi.pClearValues    = &clear;
+    pCmdBeginPass(g_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport vp { 0.0f, 0.0f, (float)g_offW, (float)g_offH, 0.0f, 1.0f };
+    VkRect2D   sc { { 0, 0 }, { g_offW, g_offH } };
+    pCmdSetViewport(g_cmd, 0, 1, &vp);
+    pCmdSetScissor(g_cmd, 0, 1, &sc);
+    pCmdBindPipe(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pmPipe);
+
+    VkDeviceSize off = 0;
+    pCmdBindVb(g_cmd, 0, 1, &g_pmVb, &off);
+
+    const uint32_t n = vertices < 3 ? vertices : 3;
+    pCmdDraw(g_cmd, n, 1, 0, 0);
+    pCmdEndPass(g_cmd);
+    if (pEndCmd(g_cmd) != VK_SUCCESS) return false;
+
+    VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &g_cmd;
+    if (pSubmit(g_queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+    pQueueIdle(g_queue);   // фаза 5.0: простота важнее скорости
+
+    g_offLayout = OffLayout::TransferSrc;
+    printf("[GPU]   PM4-рендер: прокси-треугольник (%u вершин запрошено)\n", vertices);
+    fflush(stdout);
+    return true;
+}
+
+// Общий хвост кадра (CPU-путь и PM4-путь): оффскрин (уже в TRANSFER_SRC)
+// -> картинка свапчейна -> PRESENT_SRC. КБ должен быть в записи.
+static void CmdOffToSwap(VkCommandBuffer cb, uint32_t idx, uint32_t cw, uint32_t ch) {
+    Barrier(cb, g_swImg[idx],
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+    VkImageCopy cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cp.srcSubresource.layerCount = 1;
+    cp.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cp.dstSubresource.layerCount = 1;
+    cp.extent = { cw, ch, 1 };
+    pCmdCopyImg(cb, g_off, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                g_swImg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+
+    Barrier(cb, g_swImg[idx],
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
 }
 
 // --- Public API -----------------------------------------------------------------
@@ -678,13 +1116,20 @@ bool Present(uint32_t w, uint32_t h, uint64_t bytes) {
     if (pBeginCmd(g_cmd, &bi) != VK_SUCCESS) return false;
 
     if (doCopy) {
-        // 1) буфер -> оффскрин
-        if (!g_offIsDst) {
+        // 1) буфер -> оффскрин: барьер из ФАКТИЧЕСКОГО текущего лейаута
+        //    (инвариант прошлого кадра — TRANSFER_SRC).
+        if (g_offLayout == OffLayout::Undefined) {
             Barrier(g_cmd, g_off,
                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-            g_offIsDst = true;
+            g_offLayout = OffLayout::TransferDst;
+        } else if (g_offLayout == OffLayout::TransferSrc) {
+            Barrier(g_cmd, g_off,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            g_offLayout = OffLayout::TransferDst;
         }
         VkBufferImageCopy reg;
         memset(&reg, 0, sizeof(reg));
@@ -694,35 +1139,15 @@ bool Present(uint32_t w, uint32_t h, uint64_t bytes) {
         pCmdCopyBufToImg(g_cmd, g_stage, g_off,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
 
-        // 2) оффскрин -> картинка свапчейна (форматы одной размерности)
+        // 2) оффскрин в TRANSFER_SRC — инвариант и для CPU, и для PM4-пути
         Barrier(g_cmd, g_off,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        Barrier(g_cmd, g_swImg[idx],
-                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        g_offLayout = OffLayout::TransferSrc;
 
-        VkImageCopy cp;
-        memset(&cp, 0, sizeof(cp));
-        cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        cp.srcSubresource.layerCount = 1;
-        cp.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        cp.dstSubresource.layerCount = 1;
-        cp.extent = { cw, ch, 1 };
-        pCmdCopyImg(g_cmd, g_off, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    g_swImg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-
-        // 3) вернуть лейауты: свапчейн — на показ, оффскрин — под следующий кадр
-        Barrier(g_cmd, g_swImg[idx],
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
-        Barrier(g_cmd, g_off,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        // 3) оффскрин -> картинка свапчейна -> на показ (общий хвост путей)
+        CmdOffToSwap(g_cmd, idx, cw, ch);
     }
 
     if (pEndCmd(g_cmd) != VK_SUCCESS) return false;
@@ -752,9 +1177,73 @@ bool Present(uint32_t w, uint32_t h, uint64_t bytes) {
     return true;
 }
 
+// Показ PM4-кадра: оффскрин уже содержит треугольник (RenderPm4) и лежит в
+// TRANSFER_SRC — просто копируем в свапчейн и показываем.
+bool PresentPm4(uint32_t w, uint32_t h) {
+    if (g_winClosed || g_noDevice || !g_dev || !g_swap) return false;
+    if (!g_pmReady || !g_offFb) return false;   // рендера не было — показывать нечего
+
+    PumpMessages();
+    if (g_winClosed) return false;
+
+    uint32_t idx = 0;
+    VkResult r = pAcquire(g_dev, g_swap, UINT64_MAX, g_semAcq, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (!RecreateSwapchain()) return false;
+        r = pAcquire(g_dev, g_swap, UINT64_MAX, g_semAcq, VK_NULL_HANDLE, &idx);
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
+
+    const uint32_t cw = w < g_ext.width  ? w : g_ext.width;
+    const uint32_t ch = h < g_ext.height ? h : g_ext.height;
+    if (cw == 0 || ch == 0) return false;
+
+    VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pResetCmd(g_cmd, 0);
+    if (pBeginCmd(g_cmd, &bi) != VK_SUCCESS) return false;
+
+    CmdOffToSwap(g_cmd, idx, cw, ch);
+
+    if (pEndCmd(g_cmd) != VK_SUCCESS) return false;
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &g_semAcq;
+    si.pWaitDstStageMask = &waitStage;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_cmd;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &g_semDone;
+    if (pSubmit(g_queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+
+    VkSwapchainKHR sc = g_swap;
+    VkPresentInfoKHR pi { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &g_semDone;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &sc;
+    pi.pImageIndices = &idx;
+    r = pPresent(g_queue, &pi);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) RecreateSwapchain();
+
+    pQueueIdle(g_queue);
+    return true;
+}
+
 void Shutdown() {
     if (g_dev) pDevIdle(g_dev);
-    DestroyFrame();
+    DestroyFrame();   // фреймбуфер+view оффскрина — вместе с image
+    if (g_pmPipe)   { pDestroyPipeline(g_dev, g_pmPipe, nullptr); g_pmPipe = VK_NULL_HANDLE; }
+    if (g_pmLayout) { pDestroyPipeLayout(g_dev, g_pmLayout, nullptr); g_pmLayout = VK_NULL_HANDLE; }
+    if (g_pmPass)   { pDestroyPass(g_dev, g_pmPass, nullptr); g_pmPass = VK_NULL_HANDLE; }
+    if (g_pmVs)     { pDestroyShader(g_dev, g_pmVs, nullptr); g_pmVs = VK_NULL_HANDLE; }
+    if (g_pmFs)     { pDestroyShader(g_dev, g_pmFs, nullptr); g_pmFs = VK_NULL_HANDLE; }
+    if (g_pmVb)     { pDestroyBuffer(g_dev, g_pmVb, nullptr); g_pmVb = VK_NULL_HANDLE; }
+    if (g_pmVbMem)  { pFreeMem(g_dev, g_pmVbMem, nullptr); g_pmVbMem = VK_NULL_HANDLE; }
+    g_pmVbMap = nullptr;
+    g_pmReady = false;
     if (g_semAcq)  { pDestroySem(g_dev, g_semAcq, nullptr);  g_semAcq = VK_NULL_HANDLE; }
     if (g_semDone) { pDestroySem(g_dev, g_semDone, nullptr); g_semDone = VK_NULL_HANDLE; }
     if (g_cmdPool) { pDestroyPool(g_dev, g_cmdPool, nullptr); g_cmdPool = VK_NULL_HANDLE; }
@@ -991,6 +1480,8 @@ static void SayOnce() {
 bool Prepare(uint32_t, uint32_t, uint64_t) { SayOnce(); return false; }
 void* StagePtr(uint64_t* sizeOut) { if (sizeOut) *sizeOut = 0; return nullptr; }
 bool Present(uint32_t, uint32_t, uint64_t) { return false; }
+bool RenderPm4(uint32_t) { SayOnce(); return false; }
+bool PresentPm4(uint32_t, uint32_t) { return false; }
 void Shutdown() {}
 bool DeviceAlive() { return false; }
 void SetPreferredDevice(int) {}

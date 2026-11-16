@@ -19,10 +19,19 @@ namespace zrx { namespace pm4 {
 typedef const uint32_t* (*ResolveFn)(uint64_t guestAddr, uint64_t bytes,
                                      void* user);
 
+// Кадровая сводка (фаза 5.2): что парсер увидел в потоке за прогон.
+// Пока честно только про DRAW_INDEX_AUTO — реальное исполнение PM4 впереди.
+struct Frame {
+    bool     hasDraw   = false;   // встречен DRAW-пакет
+    uint32_t drawCount = 0;       // вершин в последнем DRAW-пакете
+};
+
 // Разбирает ndwords dword'ов и печатает пакет. depth — уровень вложенности
 // (рекурсия в INDIRECT_BUFFER, не глубже 2). resolve может быть nullptr —
-// тогда вложенные буферы печатаются только адресом.
+// тогда вложенные буферы печатаются только адресом. frame (если не nullptr)
+// заполняется сводкой виденных пакетов.
 void DumpStream(const char* label, const uint32_t* d, uint32_t ndwords,
-                int depth, ResolveFn resolve, void* user);
+                int depth, ResolveFn resolve, void* user,
+                Frame* frame = nullptr);
 
 } } // namespace zrx::pm4
