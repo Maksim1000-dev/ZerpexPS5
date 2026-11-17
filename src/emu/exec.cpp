@@ -204,24 +204,36 @@ static bool HeapInit(Memory& m) {
     return false;
 }
 
-static uint64_t HeapMalloc(uint64_t n) {
+// Выделение с ВЫРАВНИВАНИЕМ. Заголовок {size, magic} лежит в 16 байтах ПЕРЕД
+// возвращаемым указателем (для align > 16 он прячется в паддинге). Выравнивание
+// критично: гостевой libc зовёт memalign(0x1000/0x80, ...) и на невыровненных
+// ответах его метаданные портятся (прогон 7.6: malloc с размером = указателю).
+static uint64_t HeapAllocAligned(uint64_t align, uint64_t n, const char* what) {
     if (!g_heapHost) return 0;
     if (!n) n = 1;
+    if (align < 16) align = 16;
+    if (align & (align - 1)) {
+        printf("[7.6] %s: выравнивание 0x%llX не степень двойки — беру 16\n",
+               what ? what : "?", (unsigned long long)align);
+        align = 16;
+    }
     std::lock_guard<std::mutex> lk(g_heapMx);
     const uint64_t payload = (n + 0xF) & ~0xFull;
-    const uint64_t need    = 16 + payload;
-    if (g_heapOff + need > g_heapCap) {
-        printf("[7.6] куча гостя КОНЧИЛАСЬ (off=0x%llX, надо 0x%llX) — верну 0\n",
-               (unsigned long long)g_heapOff, (unsigned long long)need);
+    uint64_t start = (g_heapOff + align - 1) & ~(align - 1);
+    if (start < 16) start = align;      // под заголовок (ptr-16) нужно место
+    const uint64_t end  = start + payload;
+    if (n > (512ull << 20) || end > g_heapCap) {
+        printf("[7.6] %s: ОТКАЗ size=0x%llX align=0x%llX (off=0x%llX) — верну 0\n",
+               what ? what : "?", (unsigned long long)n, (unsigned long long)align,
+               (unsigned long long)g_heapOff);
         fflush(stdout);
         return 0;
     }
-    uint8_t* h = g_heapHost + g_heapOff;
-    *(uint64_t*)h     = n;                      // запрошенный размер (для realloc)
+    uint8_t* h = g_heapHost + (start - 16);
+    *(uint64_t*)h     = n;              // запрошенный размер (для realloc)
     *(uint32_t*)(h+8) = kHeapMagic;
-    const uint64_t ptr = g_heapBase + g_heapOff + 16;
-    g_heapOff += need;
-    return ptr;
+    g_heapOff = end;
+    return g_heapBase + start;
 }
 
 static bool HeapOwns(uint64_t p) {
@@ -229,7 +241,7 @@ static bool HeapOwns(uint64_t p) {
 }
 
 static uint64_t HeapCalloc(uint64_t n) {
-    const uint64_t p = HeapMalloc(n);
+    const uint64_t p = HeapAllocAligned(16, n, "calloc");
     if (p && g_mem) {
         void* h = (void*)(uintptr_t)g_mem->Ptr(p);
         if (h) memset(h, 0, (size_t)n);
@@ -238,7 +250,7 @@ static uint64_t HeapCalloc(uint64_t n) {
 }
 
 static uint64_t HeapRealloc(uint64_t p, uint64_t n) {
-    if (!p) return HeapMalloc(n);
+    if (!p) return HeapAllocAligned(16, n, "realloc");
     if (!HeapOwns(p)) {
         static bool said = false;
         if (!said) {
@@ -247,14 +259,14 @@ static uint64_t HeapRealloc(uint64_t p, uint64_t n) {
                    (unsigned long long)p);
             fflush(stdout);
         }
-        return HeapMalloc(n);
+        return HeapAllocAligned(16, n, "realloc");
     }
     uint64_t old = 0;
     if (g_mem) {
         const uint8_t* h = (const uint8_t*)(uintptr_t)g_mem->Ptr(p - 16);
         if (h && *(const uint32_t*)(h+8) == kHeapMagic) old = *(const uint64_t*)h;
     }
-    const uint64_t q = HeapMalloc(n);
+    const uint64_t q = HeapAllocAligned(16, n, "realloc");
     if (q && old && g_mem) {
         void* d = (void*)(uintptr_t)g_mem->Ptr(q);
         const void* s = (const void*)(uintptr_t)g_mem->Ptr(p);
@@ -285,15 +297,19 @@ static uint64_t HeapMemmove(uint64_t dst, uint64_t src, uint64_t n) {
 //   PLT[195] free(p)              — парный к calloc в коде роста массива
 //   PLT[210] realloc(p, n)        — паттерн роста массива в 0x1a2ab80
 //   PLT[193] memcpy(dst, src, n)  — звался как (dst, r12, r15*8)
+//   PLT[210] memalign(align, size) — прогоны 7.6: (0x80,0x8A0), (0x1000, малые);
+//             если первый аргумент — указатель из нашей кучи, то это realloc
 static const char* kImpMalloc  = "fJnpuVVBbKk#W#W";
 static const char* kImpCalloc  = "2X5agFjKxMc#W#W";
 static const char* kImpFree    = "tIhsqj0qsFE#W#W";
-static const char* kImpRealloc = "gQX+4GDQjpM#W#W";
+static const char* kImpAligned = "gQX+4GDQjpM#W#W";
 static const char* kImpMemcpy  = "Q3VBxCXhUHs#W#W";
 
 // Фаза 7.6: последняя надежда. Сюда попадают исключения, которые не перехватил
 // VEH (чужие нити, код вне гостя). Раньше они убивали процесс МОЛЧА — без
-// итога в логе. Теперь: диагноз в лог, потом честная смерть процесса.
+// итога в логе. Теперь: диагноз в лог, потом цепочка к фильтру из main.cpp.
+static LPTOP_LEVEL_EXCEPTION_FILTER s_prevUef = nullptr;
+
 static LONG WINAPI LastChanceFilter(EXCEPTION_POINTERS* ep) {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -314,8 +330,11 @@ static LONG WINAPI LastChanceFilter(EXCEPTION_POINTERS* ep) {
                (unsigned long long)ep->ContextRecord->Rdx,
                (unsigned long long)ep->ContextRecord->Rsp,
                (unsigned long long)ep->ContextRecord->Rbp);
-    printf("[CRASH] лог сохранён в build\\zerpex_log.txt — процесс завершается\n");
+    printf("[CRASH] лог сохранён в build\\zerpex_log.txt\n");
     fflush(stdout);
+    Sleep(400);   // дать фоновому тиру дописать хвост лога
+    // Цепочка: дальше работает фильтр из main.cpp — он держит окно открытым.
+    if (s_prevUef) return s_prevUef(ep);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -392,10 +411,15 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 ReadGuestArgs(c, a);
                 uint64_t res = 0;
                 bool hit = true;
-                if      (!std::strcmp(sym, kImpMalloc))  res = HeapMalloc(a[0]);
+                if      (!std::strcmp(sym, kImpMalloc))  res = HeapAllocAligned(16, a[0], "malloc");
                 else if (!std::strcmp(sym, kImpCalloc))  res = HeapCalloc(a[0] * a[1]);
                 else if (!std::strcmp(sym, kImpFree))    res = 0;      // no-op, честно
-                else if (!std::strcmp(sym, kImpRealloc)) res = HeapRealloc(a[0], a[1]);
+                else if (!std::strcmp(sym, kImpAligned)) {
+                    // Гибрид: (align, size) для memalign ИЛИ (p, n) для realloc —
+                    // различаем по тому, лежит ли a[0] в нашей куче.
+                    res = HeapOwns(a[0]) ? HeapRealloc(a[0], a[1])
+                                         : HeapAllocAligned(a[0], a[1], "memalign");
+                }
                 else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(a[0], a[1], a[2]);
                 else hit = false;
                 if (hit) {
@@ -639,7 +663,12 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
     // (чужие нити), больше не убивают процесс молча: LastChanceFilter
     // печатает диагноз в лог перед смертью процесса.
     static bool s_uef = false;
-    if (!s_uef) { s_uef = true; SetUnhandledExceptionFilter(&LastChanceFilter); }
+    if (!s_uef) {
+        s_uef = true;
+        // Сохраняем предыдущий фильтр (main.cpp держит окно открытым) —
+        // цепочка вместо затирания.
+        s_prevUef = SetUnhandledExceptionFilter(&LastChanceFilter);
+    }
     // VEH остаётся на весь процесс: нити гостя живут дольше Run (фаза 4).
 
     // --- Фаза 7.3: TLS/TCB ------------------------------------------------------

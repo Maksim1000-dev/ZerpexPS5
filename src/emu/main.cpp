@@ -103,6 +103,9 @@ static void PauseBeforeExit() {
     if (fgets(buf, sizeof(buf), stdin)) {
         // что-то ввели — просто выходим
     }
+    // Фаза 7.6.1: даём фоновому тиру добить хвост лога перед смертью процесса.
+    fflush(nullptr);
+    Sleep(300);
 }
 
 // Последний шанс: жёсткий краш мимо нашего VEH (баг хоста, а не гостя).
@@ -523,7 +526,12 @@ static DWORD WINAPI LogTeeProc(LPVOID) {
     char buf[4096];
     DWORD n = 0;
     for (;;) {
-        if (!ReadFile(g_logPipeRd, buf, sizeof(buf), &n, nullptr) || !n) break;
+        if (!ReadFile(g_logPipeRd, buf, sizeof(buf), &n, nullptr) || !n) {
+            // Фаза 7.6.1: краткий сбой чтения не должен замораживать файловый
+            // лог (в прогоне 7.6 ти умер и хвост лога потерялся). Живём дальше.
+            Sleep(20);
+            continue;
+        }
         if (g_logConsole) {
             DWORD w = 0;
             WriteFile(g_logConsole, buf, n, &w, nullptr);
@@ -558,6 +566,7 @@ static void StartLogTee() {
 
     g_logFile = _wfopen(path.c_str(), L"w");
     if (g_logFile) {
+        setvbuf(g_logFile, nullptr, _IONBF, 0);   // без буфера: хвост лога не теряется
         SYSTEMTIME st;
         GetLocalTime(&st);
         fprintf(g_logFile, "ZerpexPS5 log | %04u-%02u-%02u %02u:%02u:%02u\r\n",
