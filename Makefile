@@ -43,6 +43,7 @@ EMU_SRCS := src/emu/main.cpp \
             src/emu/exec.cpp \
             src/emu/gpu.cpp \
             src/emu/gpu_vk.cpp \
+            src/emu/shader_rdna2.cpp \
             src/emu/pm4.cpp \
             src/emu/analyze.cpp \
             src/core/elf.cpp \

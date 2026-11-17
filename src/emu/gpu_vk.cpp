@@ -12,6 +12,7 @@
 //     тупо-надёжно — это фаза "первого пикселя", не перфоманса.
 // ============================================================================
 #include "gpu_vk.h"
+#include "shader_rdna2.h"
 
 #include <cstdio>
 #include <cstring>
@@ -759,6 +760,33 @@ static const float kProxyTri[24] = {
      0.0f,  0.8f, 0.0f, 1.0f,    0.3f, 0.3f, 1.0f, 1.0f,   // верх (синий)
 };
 
+// --- Фаза 5.3: RDNA2-байткод прокси-треугольника (синтетика, сверен по доке) --
+// Транслируется rdna2::Translate в SPIR-V; результат рисует ТОТ ЖЕ треугольник,
+// что и kVsSpirv/kFsSpirv, но собранный из guest-подобного машинного кода.
+// VS: SGPR0 = индекс вершины; компоненты и экспорт сверены с Table 62-83.
+static const uint32_t kVsRdna2[] = {
+    0x7E000200,             // V_MOV_B32     v0 = s0            (индекс вершины)
+    0x36020081,             // V_AND_B32     v1 = 1 & v0        (v0 & 1)
+    0x2C040081,             // V_LSHRREV_B32 v2 = v0 >> 1
+    0x36060481,             // V_AND_B32     v3 = 1 & v2
+    0x7E080B01,             // V_CVT_F32_I32 v4 = float(v1)     (SRC0=0x101 -> VGPR1)
+    0x7E0A0B03,             // V_CVT_F32_I32 v5 = float(v3)     (SRC0=0x103 -> VGPR3)
+    0xD54B0006, 0x03CE08F6, // VOP3A V_FMA_F32 v6 = 4.0 * v4 + (-1.0)
+    0xD54B0007, 0x03CE0AF6, // VOP3A V_FMA_F32 v7 = 4.0 * v5 + (-1.0)
+    0x7E100280,             // V_MOV_B32     v8 = 0             (SRC0=128 -> int 0)
+    0x7E1202F2,             // V_MOV_B32     v9 = 1.0           (SRC0=242 -> 1.0f)
+    0x09080706, 0x0000F08C, // EXP: gl_Position = (v6,v7,v8,v9), TARGET 12, EN=0xF, DONE
+    0xBF810000,             // S_ENDPGM
+};
+static const uint32_t kFsRdna2[] = {
+    0x7E0002F2,             // V_MOV_B32     v0 = 1.0           (красный канал)
+    0x7E020280,             // V_MOV_B32     v1 = 0             (зелёный)
+    0x7E040280,             // V_MOV_B32     v2 = 0             (синий)
+    0x7E0602F2,             // V_MOV_B32     v3 = 1.0           (альфа)
+    0x03020100, 0x0000F000, // EXP: MRT0 = (v0,v1,v2,v3), TARGET 0, EN=0xF
+    0xBF810000,             // S_ENDPGM
+};
+
 static bool InitPm4Pipeline() {
     if (g_pmReady) return true;
     if (g_pmFailed) return false;
@@ -766,20 +794,70 @@ static bool InitPm4Pipeline() {
 
     printf("[GPU] шаг: PM4-пайплайн (прокси-треугольник) — сборка\n"); fflush(stdout);
 
+    // Фаза 5.3: сначала пробуем ТРАНСЛЯТОР RDNA2->SPIR-V. Отказ или отвержение
+    // драйвером — честный фолбэк на рукописные модули 5.2 (причина в логе).
     VkShaderModuleCreateInfo sci { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    sci.pCode    = kVsSpirv;
-    sci.codeSize = sizeof(kVsSpirv);
-    if (pCreateShader(g_dev, &sci, nullptr, &g_pmVs) != VK_SUCCESS) {
-        printf("[GPU]   SPIR-V вершинного шейдера отклонён драйвером\n");
+    static std::vector<uint32_t> s_vsGen, s_fsGen;   // держим код живым до vkDestroy
+    rdna2::TranslateResult tr;
+    bool vsGen = false;
+    if (rdna2::Translate(reinterpret_cast<const uint8_t*>(kVsRdna2),
+                         sizeof(kVsRdna2), true, &tr)) {
+        s_vsGen = tr.spirv;
+        sci.pCode    = s_vsGen.data();
+        sci.codeSize = s_vsGen.size() * 4;
+        if (pCreateShader(g_dev, &sci, nullptr, &g_pmVs) == VK_SUCCESS) {
+            printf("[GPU]   [5.3] VS собран ТРАНСЛЯТОРОМ из RDNA2 (%d инструкций)\n",
+                   tr.decoded);
+            fflush(stdout);
+            vsGen = true;
+        } else {
+            printf("[GPU]   [5.3] SPIR-V транслятора отклонён драйвером — фолбэк на рукописный\n");
+            g_pmVs = VK_NULL_HANDLE;
+            fflush(stdout);
+        }
+    } else {
+        printf("[GPU]   [5.3] VS трансляция не удалась: %s%s — фолбэк на рукописный\n",
+               tr.error.c_str(), tr.firstUnknown.c_str());
         fflush(stdout);
-        g_pmFailed = true; return false;
     }
-    sci.pCode    = kFsSpirv;
-    sci.codeSize = sizeof(kFsSpirv);
-    if (pCreateShader(g_dev, &sci, nullptr, &g_pmFs) != VK_SUCCESS) {
-        printf("[GPU]   SPIR-V фрагментного шейдера отклонён драйвером\n");
+    if (!vsGen) {
+        sci.pCode    = kVsSpirv;
+        sci.codeSize = sizeof(kVsSpirv);
+        if (pCreateShader(g_dev, &sci, nullptr, &g_pmVs) != VK_SUCCESS) {
+            printf("[GPU]   SPIR-V вершинного шейдера отклонён драйвером\n");
+            fflush(stdout);
+            g_pmFailed = true; return false;
+        }
+    }
+    bool fsGen = false;
+    if (rdna2::Translate(reinterpret_cast<const uint8_t*>(kFsRdna2),
+                         sizeof(kFsRdna2), false, &tr)) {
+        s_fsGen = tr.spirv;
+        sci.pCode    = s_fsGen.data();
+        sci.codeSize = s_fsGen.size() * 4;
+        if (pCreateShader(g_dev, &sci, nullptr, &g_pmFs) == VK_SUCCESS) {
+            printf("[GPU]   [5.3] FS собран ТРАНСЛЯТОРОМ из RDNA2 (%d инструкций)\n",
+                   tr.decoded);
+            fflush(stdout);
+            fsGen = true;
+        } else {
+            printf("[GPU]   [5.3] SPIR-V транслятора отклонён драйвером — фолбэк на рукописный\n");
+            g_pmFs = VK_NULL_HANDLE;
+            fflush(stdout);
+        }
+    } else {
+        printf("[GPU]   [5.3] FS трансляция не удалась: %s%s — фолбэк на рукописный\n",
+               tr.error.c_str(), tr.firstUnknown.c_str());
         fflush(stdout);
-        g_pmFailed = true; return false;
+    }
+    if (!fsGen) {
+        sci.pCode    = kFsSpirv;
+        sci.codeSize = sizeof(kFsSpirv);
+        if (pCreateShader(g_dev, &sci, nullptr, &g_pmFs) != VK_SUCCESS) {
+            printf("[GPU]   SPIR-V фрагментного шейдера отклонён драйвером\n");
+            fflush(stdout);
+            g_pmFailed = true; return false;
+        }
     }
 
     // Пустой layout: пока никаких констант/дескрипторов (5.3 добавит).
