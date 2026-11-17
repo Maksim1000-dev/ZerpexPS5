@@ -460,6 +460,28 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
         fflush(stdout);
     }
 
+    // --- Фаза 7.4: блок аргументов ядра (rdi на входе в entry) -------------------
+    // PS4/PS5-ядро передаёт entry указатель на свою структуру (rdi). Точную
+    // раскладку не имеем — строим честную гипотезу и ЛОГИРУЕМ: [0] = размер
+    // блока, [1] = база образа. Крэш гостя скажет, что он оттуда читал.
+    uint64_t argsV = 0;
+    {
+        const uint64_t loadBase = entryVaddr - e.entry;   // e.entry уже с базой
+        argsV = mem.AllocGuest(0x100, zrx::PF_R | zrx::PF_W);
+        if (argsV && mem.Ptr(argsV)) {
+            uint64_t* a = (uint64_t*)(uintptr_t)mem.Ptr(argsV);
+            a[0] = 0x100;      // размер блока
+            a[1] = loadBase;   // база образа (гипотеза: указатель на ELF)
+            printf("[7.4] kernel-args @guest 0x%llX: [0]=0x%llX (size), [1]=0x%llX (база) "
+                   "— раскладка гипотеза, крэш уточнит\n",
+                   (unsigned long long)argsV, (unsigned long long)a[0],
+                   (unsigned long long)a[1]);
+        } else {
+            printf("[7.4] kernel-args не выделился — rdi = 0 (упадёт при чтении)\n");
+        }
+        fflush(stdout);
+    }
+
     t_tid = 1;
     t_armed = true;
     t_fault[0] = 0;
@@ -470,9 +492,9 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
         printf("[EXEC] передача управления: entry 0x%llX -> хост 0x%llX (native x86-64)\n",
                (unsigned long long)entryVaddr, (unsigned long long)hostEntry);
         fflush(stdout);
-        // Гостевой entry — SysV ABI: rdi=argc, rsi=argv, rdx=envp.
+        // Гостевой entry — SysV ABI: rdi = kernel-args (фаза 7.4), rsi = 0.
         using GuestMain = void (__attribute__((sysv_abi)) *)(uint64_t, void *);
-        ((GuestMain)(uintptr_t)hostEntry)(0, nullptr);
+        ((GuestMain)(uintptr_t)hostEntry)(argsV, nullptr);
         rr.exited = true;
         rr.exitCode = 0;
         rr.status = "entry вернулся через ret — гость завершился сам";
