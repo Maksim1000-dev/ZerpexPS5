@@ -63,20 +63,45 @@ uint64_t Memory::Map(uint64_t vaddr, const uint8_t* data, uint64_t filesz,
     const uint64_t gran   = 0x10000;              // гранула выделения Windows
     const uint64_t vkBase = base & ~(gran - 1);
     const uint64_t vkSize = end - vkBase;
-    if (!AllocRegion(vkBase, vkSize, &s)) return 0;
+    // Фаза 7.2: соседние сегменты образа часто примыкают внутри гранулы 64К
+    // (seg0 кончается на 0x1B47000, seg1 запрашивает 0x1B40000) — отдельный
+    // VirtualAlloc с фиксированной базой тогда падает, сегмент «переезжает»,
+    // и identity-маппинг ломается (крэш записи в 0x1B48000 на Dead Cells).
+    // Поэтому: если диапазон уже накрыт существующим регионом — переиспользуем.
+    const MemSegment* cover = nullptr;
+    for (const MemSegment& r : segs_) {
+        if (!r.allocBase) continue;
+        if (vkBase >= r.allocBase && end <= r.allocBase + r.allocSize) {
+            cover = &r;
+            break;
+        }
+    }
+    if (cover) {
+        s.allocBase = cover->allocBase;
+        s.allocSize = cover->allocSize;
+        s.relocated = cover->relocated;
+    } else if (!AllocRegion(vkBase, vkSize, &s)) {
+        return 0;
+    }
 
-    // Хост-адрес гостевого vaddr считается от ФАКТИЧЕСКОЙ базы региона —
-    // раньше брали vaddr-base и при округлении вниз получали сдвиг на гранулу.
-    const uint64_t offInRegion = vaddr - s.allocBase;
-    s.actual = s.allocBase + offInRegion;
+    // Хост-адрес гостевого vaddr: оффсет от ГРАНУЛЫ vkBase (не от allocBase —
+    // при переносе та разница отрицательна, переполняется и memcpy пишет по
+    // сырому гостевому адресу — найдено по крэшу Dead Cells 0x1B48000).
+    const uint64_t offInRegion = vaddr - vkBase;
+    s.actual = s.relocated ? (s.allocBase + offInRegion) : vaddr;
 
     if (data && filesz)
-        memcpy((void*)(uintptr_t)(s.allocBase + offInRegion), data, (size_t)filesz);
+        memcpy((void*)(uintptr_t)s.actual, data, (size_t)filesz);
     // хвост (memsz - filesz) остаётся нулевым — VirtualAlloc даёт нулевые страницы
 
-    DWORD old = 0;
-    VirtualProtect((LPVOID)(uintptr_t)s.allocBase, (size_t)s.allocSize,
-                   ProtFromFlags(protFlags), &old);
+    // Защита — только на СПАН СЕГМЕНТА, не на весь регион: при переиспользовании
+    // региона соседний сегмент уже выставил свою защиту на весь allocSpan.
+    {
+        const uint64_t pStart = s.relocated ? s.actual : base;
+        DWORD old = 0;
+        VirtualProtect((LPVOID)(uintptr_t)pStart, (size_t)(end - base),
+                       ProtFromFlags(protFlags), &old);
+    }
 
     segs_.push_back(s);
     return s.actual;

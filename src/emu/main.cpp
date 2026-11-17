@@ -247,6 +247,7 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
                zrx::ProtStr(p.flags).c_str(),
                (unsigned long long)p.filesz, (unsigned long long)p.memsz,
                mem.Segments().back().relocated ? "  (перенесён — адрес занят)" : "");
+        fflush(stdout);   // фаза 7.2: видно место крэша, если грохнем дальше
     }
 
     // --- Фаза 4: релокации ДО исполнения (патч сканирует уже исправленный код),

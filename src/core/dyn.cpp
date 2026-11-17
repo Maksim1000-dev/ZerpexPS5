@@ -40,6 +40,11 @@ enum : uint64_t {
 enum : uint64_t {
     R_X86_64_64 = 1, R_X86_64_GLOB_DAT = 6, R_X86_64_JUMP_SLOT = 7,
     R_X86_64_RELATIVE = 8, R_X86_64_IRELATIVE = 37,
+    // Фаза 7.2: PS5 кодирует динамику по RISC-V-нумерации, хотя машина x86-64
+    // (особенность SCE). Без этих типов релокации Dead Cells молча
+    // пропускались как «неизвестные» — .data/.got оставались нулями.
+    R_RISCV_NONE = 0, R_RISCV_64 = 2, R_RISCV_RELATIVE = 3,
+    R_RISCV_COPY = 4, R_RISCV_JUMP_SLOT = 5, R_RISCV_IRELATIVE = 58,
 };
 
 struct Sym64 {
@@ -316,7 +321,7 @@ bool ApplyRelocations(const ElfImage& elf) {
 
     // Применяем
     uint64_t nRelative = 0, nIrelative = 0, n64 = 0, nGlobdat = 0, nJmpslot = 0;
-    uint64_t nUnknownType = 0, nBadPlace = 0, nBadSym = 0;
+    uint64_t nUnknownType = 0, nBadPlace = 0, nBadSym = 0, nCopy = 0;
     uint64_t nResolved = 0, nStubs = 0;
     std::vector<std::string> firstUnresolved;
 
@@ -327,19 +332,26 @@ bool ApplyRelocations(const ElfImage& elf) {
             const uint64_t place = r.r_offset + g_loadBase;   // куда писать
 
             switch (type) {
-            case R_X86_64_RELATIVE:
-                if (GuestWriteU64(place, (uint64_t)r.r_addend + g_loadBase)) ++nRelative;
-                else ++nBadPlace;
+            case R_X86_64_RELATIVE: case R_RISCV_RELATIVE:
+            case R_X86_64_IRELATIVE: case R_RISCV_IRELATIVE:
+                if (GuestWriteU64(place, (uint64_t)r.r_addend + g_loadBase)) {
+                    if (type == R_RISCV_RELATIVE || type == R_X86_64_RELATIVE)
+                        ++nRelative;
+                    else
+                        ++nIrelative;
+                } else {
+                    ++nBadPlace;
+                }
                 break;
 
-            case R_X86_64_IRELATIVE:
-                if (GuestWriteU64(place, (uint64_t)r.r_addend + g_loadBase)) ++nIrelative;
-                else ++nBadPlace;
+            case R_RISCV_COPY:
+                // копирование данных из библиотеки — у нас библиотеки не грузятся,
+                // честно считаем и пропускаем
+                ++nCopy;
                 break;
 
-            case R_X86_64_64:
-            case R_X86_64_GLOB_DAT:
-            case R_X86_64_JUMP_SLOT: {
+            case R_X86_64_64: case R_X86_64_GLOB_DAT: case R_X86_64_JUMP_SLOT:
+            case R_RISCV_64: case R_RISCV_JUMP_SLOT: {
                 if (symIdx >= symcount) { ++nBadSym; break; }
                 const uint8_t* sp = g_mem->Ptr(dtSymtab + (uint64_t)symIdx * 24);
                 if (!sp) { ++nBadSym; break; }
@@ -362,7 +374,7 @@ bool ApplyRelocations(const ElfImage& elf) {
                         ++nBadPlace;
                     }
                 }
-                if (type == R_X86_64_64) ++n64;
+                if (type == R_X86_64_64 || type == R_RISCV_64) ++n64;
                 else if (type == R_X86_64_GLOB_DAT) ++nGlobdat;
                 else ++nJmpslot;
                 break;
@@ -378,10 +390,10 @@ bool ApplyRelocations(const ElfImage& elf) {
     processTable(mainRela);
     processTable(pltRela);
 
-    printf("[DYN] применено: RELATIVE=%llu IRELATIVE=%llu 64=%llu GLOB_DAT=%llu JUMP_SLOT=%llu\n",
+    printf("[DYN] применено: RELATIVE=%llu IRELATIVE=%llu 64=%llu GLOB_DAT=%llu JUMP_SLOT=%llu COPY=%llu\n",
            (unsigned long long)nRelative, (unsigned long long)nIrelative,
            (unsigned long long)n64, (unsigned long long)nGlobdat,
-           (unsigned long long)nJmpslot);
+           (unsigned long long)nJmpslot, (unsigned long long)nCopy);
     printf("[DYN] свои символы=%llu, импортов(записей)=%llu, неизвестных типов=%llu,\n",
            (unsigned long long)nResolved, (unsigned long long)nStubs,
            (unsigned long long)nUnknownType);
