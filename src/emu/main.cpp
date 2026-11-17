@@ -367,6 +367,96 @@ static void AnalyzeSelfReport(const zrx::analyze::SelfReport& r) {
 // SELF-контейнер = заголовок + таблица сегментов + payload. Если payload —
 // открытый ELF (домашние/расшифрованные дампы), его можно исполнять тем же
 // нативным путём, что и ELF (фаза 4). Зашифрованный retail — честная стена.
+// ----------------------------------------------------------------------------
+// Фаза 7.2.1: ВНУТРЕННИЙ ОБРАЗ из SELF-сегментов.
+//
+// PS5 SELF хранит контент LOAD-сегментов В СВОИХ сегментах (storeSize ровно
+// равен filesz LOAD-а), а вложенный ELF даёт только РАСКЛАДКУ (p_offset /
+// p_vaddr). Чтение по сырым ELF-оффсетам даёт нули/мусор: entry Dead Cells
+// читался как "00 00 ..." -> add [rax],al -> краш "запись в 0x0 @ 0x400070".
+//
+// Собираем образ так: [0..firstLoadOffset) — заголовки из SELF (elfOffset),
+// каждый PT_LOAD кладётся по СВОЕМУ p_offset, контент — из парного
+// SELF-сегмента. Пара ищется по точному совпадению размеров
+// (storeSize==filesz && memSize==memsz); у Dead Cells все 5 размеров
+// различны, пары однозначны. Если пара не нашлась — честный отказ.
+// ----------------------------------------------------------------------------
+static bool BuildInnerElf(const std::vector<uint8_t>& self, const zrx::SelfImage& si,
+                          std::vector<uint8_t>* out) {
+    if (!out || self.size() <= si.elfOffset || !si.ok || !si.hasElf) {
+        printf("  ! ВНУТРЕННИЙ ОБРАЗ: SELF/ELF не разобран — запуск невозможен\n");
+        return false;
+    }
+    const zrx::ElfImage& e = si.elf;
+
+    // firstLoadOffset: от нуля до него лежат заголовки (e_phoff внутри).
+    // maxEnd: сколько байт реально нужно под контент LOAD-ов.
+    uint64_t firstOff = ~0ull, maxEnd = 0;
+    for (const zrx::ElfSegment& p : e.phdrs) {
+        if (p.type != zrx::PT_LOAD || !p.filesz) continue;
+        if (p.offset < firstOff) firstOff = p.offset;
+        const uint64_t end = p.offset + p.filesz;
+        if (end > maxEnd) maxEnd = end;
+    }
+    if (firstOff == ~0ull || firstOff > self.size()) {
+        printf("  ! ВНУТРЕННИЙ ОБРАЗ: нет PT_LOAD с контентом\n");
+        return false;
+    }
+    if (firstOff >= 0x10000000 || maxEnd >= 0x100000000ull) {
+        printf("  ! ВНУТРЕННИЙ ОБРАЗ: подозрительные размеры (first=0x%llX maxEnd=0x%llX)\n",
+               (unsigned long long)firstOff, (unsigned long long)maxEnd);
+        return false;
+    }
+
+    out->assign((size_t)((maxEnd > firstOff ? maxEnd : firstOff) + 64), 0);
+    // Заголовки: ELF header + program headers (+ что между) — верbatim из SELF.
+    memcpy(out->data(), self.data() + si.elfOffset, (size_t)firstOff);
+
+    printf("\n  [7.2.1] внутренний образ: %s, заголовки SELF @0x%llX -> inner [0..0x%llX)\n",
+           HumanSize(out->size()).c_str(),
+           (unsigned long long)si.elfOffset, (unsigned long long)firstOff);
+
+    for (size_t k = 0; k < e.phdrs.size(); ++k) {
+        const zrx::ElfSegment& p = e.phdrs[k];
+        if (p.type != zrx::PT_LOAD || !p.filesz) continue;
+        int match = -1;
+        for (size_t i = 0; i < si.segments.size(); ++i) {
+            const zrx::SelfSegment& s = si.segments[i];
+            if (s.storeSize == p.filesz && s.memSize == p.memsz) { match = (int)i; break; }
+        }
+        if (match < 0) {
+            printf("    ! LOAD#%u filesz=%llu memsz=%llu: нет парного SELF-сегмента — отказ\n",
+                   (unsigned)k, (unsigned long long)p.filesz, (unsigned long long)p.memsz);
+            out->clear();
+            return false;
+        }
+        const zrx::SelfSegment& s = si.segments[(size_t)match];
+        if (s.offset + s.storeSize > self.size()) {
+            printf("    ! LOAD#%u: SELF-сегмент #%d вне файла — отказ\n", (unsigned)k, match);
+            out->clear();
+            return false;
+        }
+        memcpy(out->data() + p.offset, self.data() + s.offset, (size_t)p.filesz);
+        printf("    LOAD#%u inner@0x%llX filesz=%llu  <-  SELF seg#%d @0x%llX\n",
+               (unsigned)k, (unsigned long long)p.offset, (unsigned long long)p.filesz,
+               match, (unsigned long long)s.offset);
+    }
+
+    // Честный контроль: байты по entry (vaddr ещё без базы).
+    for (const zrx::ElfSegment& p : e.phdrs) {
+        if (p.type != zrx::PT_LOAD || !p.filesz) continue;
+        if (e.entry >= p.vaddr && e.entry < p.vaddr + p.filesz) {
+            const size_t at = (size_t)(p.offset + (e.entry - p.vaddr));
+            printf("    entry 0x%llX -> inner @0x%llX: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   (unsigned long long)e.entry, (unsigned long long)at,
+                   (*out)[at], (*out)[at + 1], (*out)[at + 2], (*out)[at + 3],
+                   (*out)[at + 4], (*out)[at + 5], (*out)[at + 6], (*out)[at + 7]);
+            break;
+        }
+    }
+    return true;
+}
+
 static void TryRunSelf(const std::wstring& path, const zrx::analyze::SelfReport& r) {
     if (!r.ok) return;
 
@@ -399,7 +489,15 @@ static void TryRunSelf(const std::wstring& path, const zrx::analyze::SelfReport&
     // Корень игры = папка с eboot (для /app0) — как у обычного ELF-пути.
     g_ebootDir = fs::path(path).parent_path().wstring();
     if (g_ebootDir.empty()) g_ebootDir = L".";
-    RunElfProgram(data);
+
+    // Фаза 7.2.1: запуск из ВНУТРЕННЕГО образа (контент — из SELF-сегментов).
+    zrx::SelfImage si;
+    std::vector<uint8_t> inner;
+    if (zrx::ParseSelf(all.data(), all.size(), &si) && BuildInnerElf(all, si, &inner)) {
+        RunElfProgram(inner);
+    } else {
+        printf("  Запуск отложен: без корректного внутреннего образа entry — нули.\n");
+    }
 }
 
 // ----------------------------------------------------------------------------
