@@ -422,7 +422,10 @@ static bool BuildInnerElf(const std::vector<uint8_t>& self, const zrx::SelfImage
         int match = -1;
         for (size_t i = 0; i < si.segments.size(); ++i) {
             const zrx::SelfSegment& s = si.segments[i];
-            if (s.storeSize == p.filesz && s.memSize == p.memsz) { match = (int)i; break; }
+            // SELF не кодирует bss-хвост LOAD-а (memsz > filesz): у контейнера
+            // mem == store, и это ФАЙЛОВЫЙ размер (Dead Cells LOAD#7:
+            // filesz=5979728 memsz=8689488, SELF seg#7 store=mem=5979728).
+            if (s.storeSize == p.filesz && s.memSize == p.filesz) { match = (int)i; break; }
         }
         if (match < 0) {
             printf("    ! LOAD#%u filesz=%llu memsz=%llu: нет парного SELF-сегмента — отказ\n",
