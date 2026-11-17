@@ -557,7 +557,9 @@ static void StartLogTee() {
 
     SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
     HANDLE wr = nullptr;
-    if (!CreatePipe(&g_logPipeRd, &wr, &sa, 0)) return;
+    // Фаза 7.6.2: буфер 1 МБ — если фоновый ти встанет, writer не заблокируется
+    // на первых же килобайтах (прогон 7.6.1: обрыв посреди строки).
+    if (!CreatePipe(&g_logPipeRd, &wr, &sa, 1u << 20)) return;
     const int pipeFd = _open_osfhandle((intptr_t)wr, _O_WRONLY);
     if (pipeFd < 0) { CloseHandle(g_logPipeRd); CloseHandle(wr); return; }
     _dup2(pipeFd, 1);

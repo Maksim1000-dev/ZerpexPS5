@@ -79,16 +79,47 @@ static const int JMPL_EXIT        = 777;   // sys_exit (процесс)
 static const int JMPL_THREAD_EXIT = 888;   // sys_thr_exit (нить)
 static const int JMPL_FAULT       = -1;    // краш гостя (текст в t_fault)
 
+// Фаза 7.6.2: аварийная запись В ФАЙЛ лога мимо stdout-пайпа. Прогон 7.6.1:
+// последняя строка ("КРАШ ГОСТЯ: memcpy: ... len=") обрезана посреди строки и
+// после неё в zerpex_log.txt ничего — stdout-пайп (ти) встал, а printf в
+// полный пайп блокирует нить навсегда. Только kernel32 (CreateFileW/WriteFile)
+// — безопасно и из контекста исключения. Лог лежит рядом с EXE (как StartLogTee
+// в main.cpp).
+static void CrashAppendFile(const char* text) {
+    if (!text || !text[0]) return;
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = exe;
+    const size_t sl = dir.find_last_of(L"\\/");
+    dir = (sl == std::wstring::npos) ? std::wstring(L".") : dir.substr(0, sl);
+    HANDLE h = CreateFileW((dir + L"\\zerpex_log.txt").c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    char buf[560];
+    const int k = snprintf(buf, sizeof(buf), "[CRASH-FILE] %s\r\n", text);
+    DWORD w = 0;
+    if (k > 0) WriteFile(h, buf, (DWORD)k, &w, nullptr);
+    CloseHandle(h);
+}
+
 [[noreturn]] static void BailOut(int code, const char* text) {
     t_fault[0] = 0;
     if (text) {
         snprintf(t_fault, sizeof(t_fault), "%s", text);
+        // Фаза 7.6.2: СНАЧАЛА файл (мимо пайпа), потом stdout — если пайп встал
+        // и printf заблокирует нить, диагноз уже лежит в zerpex_log.txt.
+        CrashAppendFile(t_fault);
         // Фаза 7.6: диагноз печатается ДО longjmp — если размотка не дойдёт
         // до [ИТОГ] в Run(), краш всё равно останется в логе (а не молча).
         printf("[EXEC] КРАШ ГОСТЯ: %s\n", t_fault);
         fflush(stdout);
     }
     t_armed = false;
+    // Офлайн-тест tools/veh_bail_test.cpp: longjmp ПРЯМО из диспетчера на этом
+    // тулчейне ЖИВ (вернулись с v=100). Вариант "трамплин через подмену
+    // контекста" убивает процесс (0xC0000028, двойной диспетч) — НЕ использовать.
     longjmp(t_jmp, code);
 }
 
@@ -249,7 +280,7 @@ static uint64_t HeapCalloc(uint64_t n) {
     return p;
 }
 
-static uint64_t HeapRealloc(uint64_t p, uint64_t n) {
+[[maybe_unused]] static uint64_t HeapRealloc(uint64_t p, uint64_t n) {
     if (!p) return HeapAllocAligned(16, n, "realloc");
     if (!HeapOwns(p)) {
         static bool said = false;
@@ -295,10 +326,13 @@ static uint64_t HeapMemmove(uint64_t dst, uint64_t src, uint64_t n) {
 //   PLT[261] malloc(size)         — звался из libc-аллокатора 0x1b458d0 (size=0x40...)
 //   PLT[194] calloc(nmemb, size)  — звался как (1, 0x8a0) из 0x1a2ab80 (крэш 0x1A2ABD6)
 //   PLT[195] free(p)              — парный к calloc в коде роста массива
-//   PLT[210] realloc(p, n)        — паттерн роста массива в 0x1a2ab80
 //   PLT[193] memcpy(dst, src, n)  — звался как (dst, r12, r15*8)
-//   PLT[210] memalign(align, size) — прогоны 7.6: (0x80,0x8A0), (0x1000, малые);
-//             если первый аргумент — указатель из нашей кучи, то это realloc
+//   PLT[210] malloc-подобный, ОДИН аргумент rdi; rsi — мусор-остаток регистра.
+//     Офлайн-разбор строк вызовов (tools/scan_calls): 0x1A2AA5D lea rdi,[r13*8]
+//     (рост массива), 0x1A1C613 mov edi,0x70 при ЖИВОМ r14=rsi. Гипотезы
+//     realloc/memalign сняты: пара (0x80,0x8A0) — это 0x8A0 хвост rsi от
+//     calloc(1,0x8A0); отказ malloc(0x10) из-за rsi=0x700000065100 дал
+//     memcpy(dst=0) и краш (прогон 7.6.1).
 static const char* kImpMalloc  = "fJnpuVVBbKk#W#W";
 static const char* kImpCalloc  = "2X5agFjKxMc#W#W";
 static const char* kImpFree    = "tIhsqj0qsFE#W#W";
@@ -332,6 +366,14 @@ static LONG WINAPI LastChanceFilter(EXCEPTION_POINTERS* ep) {
                (unsigned long long)ep->ContextRecord->Rbp);
     printf("[CRASH] лог сохранён в build\\zerpex_log.txt\n");
     fflush(stdout);
+    {
+        char cbuf[192];
+        snprintf(cbuf, sizeof(cbuf),
+                 "НЕПЕРЕХВАЧЕННОЕ 0x%08X @ host RIP 0x%llX (guest 0x%llX), адрес 0x%llX",
+                 (unsigned)code, (unsigned long long)rip,
+                 (unsigned long long)guestRip, (unsigned long long)fa);
+        CrashAppendFile(cbuf);   // 7.6.2: дубль в файл мимо пайпа
+    }
     Sleep(400);   // дать фоновому тиру дописать хвост лога
     // Цепочка: дальше работает фильтр из main.cpp — он держит окно открытым.
     if (s_prevUef) return s_prevUef(ep);
@@ -415,10 +457,9 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 else if (!std::strcmp(sym, kImpCalloc))  res = HeapCalloc(a[0] * a[1]);
                 else if (!std::strcmp(sym, kImpFree))    res = 0;      // no-op, честно
                 else if (!std::strcmp(sym, kImpAligned)) {
-                    // Гибрид: (align, size) для memalign ИЛИ (p, n) для realloc —
-                    // различаем по тому, лежит ли a[0] в нашей куче.
-                    res = HeapOwns(a[0]) ? HeapRealloc(a[0], a[1])
-                                         : HeapAllocAligned(a[0], a[1], "memalign");
+                    // PLT[210] = malloc(rdi); rsi — мусор-остаток (см. kImp*-комментарий).
+                    // Офлайн-разбор строк вызовов снял гипотезы realloc/memalign.
+                    res = HeapAllocAligned(16, a[0], "malloc");
                 }
                 else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(a[0], a[1], a[2]);
                 else hit = false;
