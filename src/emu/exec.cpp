@@ -81,7 +81,13 @@ static const int JMPL_FAULT       = -1;    // краш гостя (текст в
 
 [[noreturn]] static void BailOut(int code, const char* text) {
     t_fault[0] = 0;
-    if (text) snprintf(t_fault, sizeof(t_fault), "%s", text);
+    if (text) {
+        snprintf(t_fault, sizeof(t_fault), "%s", text);
+        // Фаза 7.6: диагноз печатается ДО longjmp — если размотка не дойдёт
+        // до [ИТОГ] в Run(), краш всё равно останется в логе (а не молча).
+        printf("[EXEC] КРАШ ГОСТЯ: %s\n", t_fault);
+        fflush(stdout);
+    }
     t_armed = false;
     longjmp(t_jmp, code);
 }
@@ -167,6 +173,152 @@ static int64_t GpuExecuteOffVeh(const char* name, const uint64_t args[8]) {
 
 // --- VEH-обработчик ----------------------------------------------------------
 // Один на весь процесс; каждая гостевая нить фильтруется своим t_armed.
+// --- Фаза 7.6: гостевая куча -------------------------------------------------
+// Импорты libc malloc/calloc/realloc/free обслуживает СУБАЛЛОКАТОР: один
+// регион гостевой памяти + bump-выделение. Заголовок 16 байт (размер + магия)
+// нужен realloc'у; free — честный no-op (память не переиспользуется: для
+// этапа запуска утечки не страшны).
+static constexpr uint64_t kHeapSize  = 256ull << 20;
+static constexpr uint32_t kHeapMagic = 0x5A52584B;   // "ZRXK"
+static uint64_t g_heapBase = 0, g_heapOff = 0, g_heapCap = 0;
+static uint8_t* g_heapHost = nullptr;
+static std::mutex g_heapMx;
+
+static bool HeapInit(Memory& m) {
+    if (g_heapHost) return true;
+    const uint64_t sizes[3] = { kHeapSize, kHeapSize >> 2, kHeapSize >> 4 };
+    for (const uint64_t sz : sizes) {
+        const uint64_t b = m.AllocGuest(sz, zrx::PF_R | zrx::PF_W);
+        if (b) {
+            g_heapBase = b;
+            g_heapHost = (uint8_t*)(uintptr_t)m.Ptr(b);
+            g_heapCap  = sz;
+            printf("[7.6] куча гостя: регион guest 0x%llX, %llu МБ, bump (free = no-op)\n",
+                   (unsigned long long)g_heapBase, (unsigned long long)(sz >> 20));
+            fflush(stdout);
+            return g_heapHost != nullptr;
+        }
+    }
+    printf("[7.6] кучу гостя выделить не удалось — libc-импорты останутся заглушками\n");
+    fflush(stdout);
+    return false;
+}
+
+static uint64_t HeapMalloc(uint64_t n) {
+    if (!g_heapHost) return 0;
+    if (!n) n = 1;
+    std::lock_guard<std::mutex> lk(g_heapMx);
+    const uint64_t payload = (n + 0xF) & ~0xFull;
+    const uint64_t need    = 16 + payload;
+    if (g_heapOff + need > g_heapCap) {
+        printf("[7.6] куча гостя КОНЧИЛАСЬ (off=0x%llX, надо 0x%llX) — верну 0\n",
+               (unsigned long long)g_heapOff, (unsigned long long)need);
+        fflush(stdout);
+        return 0;
+    }
+    uint8_t* h = g_heapHost + g_heapOff;
+    *(uint64_t*)h     = n;                      // запрошенный размер (для realloc)
+    *(uint32_t*)(h+8) = kHeapMagic;
+    const uint64_t ptr = g_heapBase + g_heapOff + 16;
+    g_heapOff += need;
+    return ptr;
+}
+
+static bool HeapOwns(uint64_t p) {
+    return g_heapBase && p >= g_heapBase + 16 && p < g_heapBase + g_heapCap;
+}
+
+static uint64_t HeapCalloc(uint64_t n) {
+    const uint64_t p = HeapMalloc(n);
+    if (p && g_mem) {
+        void* h = (void*)(uintptr_t)g_mem->Ptr(p);
+        if (h) memset(h, 0, (size_t)n);
+    }
+    return p;
+}
+
+static uint64_t HeapRealloc(uint64_t p, uint64_t n) {
+    if (!p) return HeapMalloc(n);
+    if (!HeapOwns(p)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            printf("[7.6] realloc: указатель 0x%llX не из нашей кучи — новый блок без копии\n",
+                   (unsigned long long)p);
+            fflush(stdout);
+        }
+        return HeapMalloc(n);
+    }
+    uint64_t old = 0;
+    if (g_mem) {
+        const uint8_t* h = (const uint8_t*)(uintptr_t)g_mem->Ptr(p - 16);
+        if (h && *(const uint32_t*)(h+8) == kHeapMagic) old = *(const uint64_t*)h;
+    }
+    const uint64_t q = HeapMalloc(n);
+    if (q && old && g_mem) {
+        void* d = (void*)(uintptr_t)g_mem->Ptr(q);
+        const void* s = (const void*)(uintptr_t)g_mem->Ptr(p);
+        if (d && s) memcpy(d, s, (size_t)(old < n ? old : n));
+    }
+    return q;
+}
+
+static uint64_t HeapMemmove(uint64_t dst, uint64_t src, uint64_t n) {
+    if (!g_mem || !n) return dst;
+    void* d = (void*)(uintptr_t)g_mem->Ptr(dst);
+    void* s = (void*)(uintptr_t)g_mem->Ptr(src);
+    if (!d || !s) {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "memcpy: недоступная память dst=0x%llX src=0x%llX len=%llu",
+                 (unsigned long long)dst, (unsigned long long)src, (unsigned long long)n);
+        BailOut(JMPL_FAULT, buf);
+    }
+    memmove(d, s, (size_t)n);
+    return dst;
+}
+
+// Имена импортов (скремблированы SCE) — опознаны ПО ПОВЕДЕНИЮ вызовов;
+// индексы PLT подтверждены полной картой: tools/import_map.txt.
+//   PLT[261] malloc(size)         — звался из libc-аллокатора 0x1b458d0 (size=0x40...)
+//   PLT[194] calloc(nmemb, size)  — звался как (1, 0x8a0) из 0x1a2ab80 (крэш 0x1A2ABD6)
+//   PLT[195] free(p)              — парный к calloc в коде роста массива
+//   PLT[210] realloc(p, n)        — паттерн роста массива в 0x1a2ab80
+//   PLT[193] memcpy(dst, src, n)  — звался как (dst, r12, r15*8)
+static const char* kImpMalloc  = "fJnpuVVBbKk#W#W";
+static const char* kImpCalloc  = "2X5agFjKxMc#W#W";
+static const char* kImpFree    = "tIhsqj0qsFE#W#W";
+static const char* kImpRealloc = "gQX+4GDQjpM#W#W";
+static const char* kImpMemcpy  = "Q3VBxCXhUHs#W#W";
+
+// Фаза 7.6: последняя надежда. Сюда попадают исключения, которые не перехватил
+// VEH (чужие нити, код вне гостя). Раньше они убивали процесс МОЛЧА — без
+// итога в логе. Теперь: диагноз в лог, потом честная смерть процесса.
+static LONG WINAPI LastChanceFilter(EXCEPTION_POINTERS* ep) {
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    const uint64_t rip = ep->ContextRecord ? ep->ContextRecord->Rip : 0;
+    uint64_t guestRip = 0;
+    const bool inG = g_mem && g_mem->GuestForHost(rip, &guestRip);
+    const uint64_t fa = ep->ExceptionRecord->NumberParameters >= 2
+                            ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
+    printf("[CRASH] НЕПЕРЕХВАЧЕННОЕ исключение 0x%08X @ host RIP 0x%llX "
+           "(guest 0x%llX %s), адрес 0x%llX\n",
+           (unsigned)code, (unsigned long long)rip, (unsigned long long)guestRip,
+           inG ? "В ГОСТЕ" : "не в госте", (unsigned long long)fa);
+    if (ep->ContextRecord)
+        printf("[CRASH] RAX=0x%llX RBX=0x%llX RCX=0x%llX RDX=0x%llX RSP=0x%llX RBP=0x%llX\n",
+               (unsigned long long)ep->ContextRecord->Rax,
+               (unsigned long long)ep->ContextRecord->Rbx,
+               (unsigned long long)ep->ContextRecord->Rcx,
+               (unsigned long long)ep->ContextRecord->Rdx,
+               (unsigned long long)ep->ContextRecord->Rsp,
+               (unsigned long long)ep->ContextRecord->Rbp);
+    printf("[CRASH] лог сохранён в build\\zerpex_log.txt — процесс завершается\n");
+    fflush(stdout);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
     // Фаза 7.3: активен тест wrfsbase (DetectFsBase, до t_armed)? #UD значит
     // "ОС не включила CR4.FSGSBASE": пропускаем инструкцию (5 байт) — это
@@ -232,25 +384,31 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 c->Rip += 2;             // ud2 — 2 байта; дальше в слоте стоит ret
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            // Фаза 7.5: импорт-АЛЛОКАТОР, опознанный ПО ПОВЕДЕНИЮ. Лог крэша
-            // 0x1A5B18F + дизассемблер: внутренний аллокатор libc 0x1b458d0(size)
-            // вызывает этот импорт и результат использует как указатель на
-            // структуру {self,self,self,0x101...}. Имя скремблировано SCE —
-            // честно даём гостевую память (выравнена на страницу, malloc-совместимо).
-            if (sym && std::strcmp(sym, "fJnpuVVBbKk#W#W") == 0 && g_mem) {
-                static std::atomic<uint64_t> nAlloc{0};
-                uint64_t gargs[8];
-                ReadGuestArgs(c, gargs);
-                const uint64_t sz = ((gargs[0] ? gargs[0] : 1) + 0xF) & ~0xFull;
-                const uint64_t p = g_mem->AllocGuest(sz, zrx::PF_R | zrx::PF_W);
-                const uint64_t n = nAlloc.fetch_add(1);
-                if (n < 8)
-                    printf("[EXEC] импорт-аллокатор fJnpuVVBbKk(size=%llu) -> guest 0x%llX\n",
-                           (unsigned long long)gargs[0], (unsigned long long)p);
-                fflush(stdout);
-                c->Rax = (DWORD64)p;
-                c->Rip += 2;
-                return EXCEPTION_CONTINUE_EXECUTION;
+            // Фаза 7.6: нормальные обработчики libc-импортов (опознаны по
+            // поведению вызовов; полная карта PLT->имя: tools/import_map.txt).
+            if (sym && g_heapHost == nullptr && g_mem) HeapInit(*g_mem);
+            if (sym && g_heapHost) {
+                uint64_t a[8];
+                ReadGuestArgs(c, a);
+                uint64_t res = 0;
+                bool hit = true;
+                if      (!std::strcmp(sym, kImpMalloc))  res = HeapMalloc(a[0]);
+                else if (!std::strcmp(sym, kImpCalloc))  res = HeapCalloc(a[0] * a[1]);
+                else if (!std::strcmp(sym, kImpFree))    res = 0;      // no-op, честно
+                else if (!std::strcmp(sym, kImpRealloc)) res = HeapRealloc(a[0], a[1]);
+                else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(a[0], a[1], a[2]);
+                else hit = false;
+                if (hit) {
+                    static std::atomic<uint32_t> nH{0};
+                    if (nH.fetch_add(1) < 14)
+                        printf("[EXEC] libc %s(0x%llX, 0x%llX, 0x%llX) -> 0x%llX\n",
+                               sym, (unsigned long long)a[0], (unsigned long long)a[1],
+                               (unsigned long long)a[2], (unsigned long long)res);
+                    fflush(stdout);
+                    c->Rax = (DWORD64)res;
+                    c->Rip += 2;             // ud2 — 2 байта; дальше в слоте ret
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
             }
             static std::mutex smx;
             static std::set<std::string> once;
@@ -336,6 +494,22 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    // Фаза 7.6: последняя линия обороны — ЛЮБОЕ исключение в гостевом коде,
+    // которое мы не умеем продолжить (0xC00000FD переполнение стека,
+    // 0xC0000409 и прочие), даёт ЧЕСТНЫЙ краш с диагнозом. Раньше такие
+    // коды улетали в CONTINUE_SEARCH и процесс умирал МОЛЧА.
+    if (inGuest) {
+        const uint64_t fa = ep->ExceptionRecord->ExceptionInformation[1];
+        uint64_t gfa = 0;
+        const bool aInG = g_mem && g_mem->GuestForHost(fa, &gfa);
+        (void)aInG;
+        char buf[288];
+        snprintf(buf, sizeof(buf),
+                 "исключение 0x%08X @ guest RIP 0x%llX (поток %llu), адрес 0x%llX (guest 0x%llX) — краш гостя",
+                 (unsigned)code, (unsigned long long)guestRip, (unsigned long long)t_tid,
+                 (unsigned long long)fa, (unsigned long long)gfa);
+        BailOut(JMPL_FAULT, buf);
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -461,6 +635,11 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
             return rr;
         }
     }
+    // Фаза 7.6: страховка самого края — исключения, которые не перехватил VEH
+    // (чужие нити), больше не убивают процесс молча: LastChanceFilter
+    // печатает диагноз в лог перед смертью процесса.
+    static bool s_uef = false;
+    if (!s_uef) { s_uef = true; SetUnhandledExceptionFilter(&LastChanceFilter); }
     // VEH остаётся на весь процесс: нити гостя живут дольше Run (фаза 4).
 
     // --- Фаза 7.3: TLS/TCB ------------------------------------------------------
