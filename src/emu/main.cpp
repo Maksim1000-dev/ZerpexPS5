@@ -228,8 +228,32 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
 
     printf("\n  [память] маппинг %u сегментов PT_LOAD:\n", (unsigned)e.loadIdx.size());
     zrx::Memory mem;
+    // Фаза 7.2: резерв СПАН-а всего образа одним блоком. Сегменты PS5
+    // примыкают внутри гранулы 64К (seg0 кончается на 0x1B47000, seg1
+    // запрашивает 0x1B40000) — по отдельности они наезжали друг на друга
+    // и «переезжали» на чужие адреса.
+    {
+        uint64_t lo = ~0ull, hi = 0;
+        for (size_t idx : e.loadIdx) {
+            const zrx::ElfSegment& p = e.phdrs[idx];
+            if (!p.memsz) continue;
+            const uint64_t b = p.vaddr & ~0xFFFull;
+            const uint64_t e2 = (p.vaddr + p.memsz + 0xFFF) & ~0xFFFull;
+            if (b < lo) lo = b;
+            if (e2 > hi) hi = e2;
+        }
+        if (hi > lo && mem.ReserveSpan(lo, hi - lo)) {
+            printf("  [память] резерв образа: 0x%llX .. 0x%llX (%.1f МБ)\n",
+                   (unsigned long long)lo, (unsigned long long)hi,
+                   (double)(hi - lo) / 1048576.0);
+            fflush(stdout);
+        }
+    }
     for (size_t idx : e.loadIdx) {
         const zrx::ElfSegment& p = e.phdrs[idx];
+        // Фаза 7.2: LOAD без прав (---) у Dead Cells содержит .dynamic —
+        // лоадер обязан его ЧИТАТЬ (крэш чтения 0x2D4F478). Даём RW.
+        const uint32_t mprot = p.flags ? p.flags : (zrx::PF_R | zrx::PF_W);
         const uint8_t* fileData = nullptr;
         if (p.filesz && p.offset + p.filesz <= data.size())
             fileData = data.data() + p.offset;
@@ -237,7 +261,7 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
             printf("    ! сегмент #%u: данные вне файла (offset=0x%llX filesz=%llu) — пропускаю содержимое\n",
                    (unsigned)idx, (unsigned long long)p.offset, (unsigned long long)p.filesz);
         }
-        const uint64_t actual = mem.Map(p.vaddr, fileData, p.filesz, p.memsz, p.flags);
+        const uint64_t actual = mem.Map(p.vaddr, fileData, p.filesz, p.memsz, mprot);
         if (!actual) {
             printf("    ! сегмент #%u: VirtualAlloc не удался\n", (unsigned)idx);
             continue;

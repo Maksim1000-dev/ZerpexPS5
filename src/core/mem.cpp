@@ -37,6 +37,7 @@ uint64_t Memory::AllocRegion(uint64_t alignedBase, uint64_t size, MemSegment* ou
     out->allocBase = (uint64_t)(uintptr_t)p;
     out->allocSize = size;
     out->relocated = relocated || ((uint64_t)(uintptr_t)p != alignedBase);
+    regions_.push_back({ out->allocBase, size, out->relocated });
     return out->allocBase;
 }
 
@@ -63,22 +64,17 @@ uint64_t Memory::Map(uint64_t vaddr, const uint8_t* data, uint64_t filesz,
     const uint64_t gran   = 0x10000;              // гранула выделения Windows
     const uint64_t vkBase = base & ~(gran - 1);
     const uint64_t vkSize = end - vkBase;
-    // Фаза 7.2: соседние сегменты образа часто примыкают внутри гранулы 64К
-    // (seg0 кончается на 0x1B47000, seg1 запрашивает 0x1B40000) — отдельный
-    // VirtualAlloc с фиксированной базой тогда падает, сегмент «переезжает»,
-    // и identity-маппинг ломается (крэш записи в 0x1B48000 на Dead Cells).
-    // Поэтому: если диапазон уже накрыт существующим регионом — переиспользуем.
-    const MemSegment* cover = nullptr;
-    for (const MemSegment& r : segs_) {
-        if (!r.allocBase) continue;
-        if (vkBase >= r.allocBase && end <= r.allocBase + r.allocSize) {
-            cover = &r;
-            break;
-        }
+    // Фаза 7.2: накрытие ищем в реестре РЕГИОНОВ (не сегментов). Общий резерв
+    // образа (ReserveSpan) уже держит весь спан — сегменты просто ложатся
+    // внутрь, никаких переездов и наездов друг на друга.
+    const Region* cover = nullptr;
+    for (const Region& r : regions_) {
+        if (!r.base) continue;
+        if (vkBase >= r.base && end <= r.base + r.size) { cover = &r; break; }
     }
     if (cover) {
-        s.allocBase = cover->allocBase;
-        s.allocSize = cover->allocSize;
+        s.allocBase = cover->base;
+        s.allocSize = cover->size;
         s.relocated = cover->relocated;
     } else if (!AllocRegion(vkBase, vkSize, &s)) {
         return 0;
@@ -139,8 +135,17 @@ uint64_t Memory::MapAnon(uint64_t vaddr, uint64_t size, uint32_t protFlags) {
     return s.vaddr;
 }
 
-uint64_t Memory::AllocGuest(uint64_t size, uint32_t protFlags) {
-    const uint64_t page = 0x1000;
+bool Memory::ReserveSpan(uint64_t base, uint64_t size) {
+    if (!size) return false;
+    MemSegment s;
+    const uint64_t gran  = 0x10000;
+    const uint64_t vkBase = base & ~(gran - 1);
+    const uint64_t vkSize = ((base + size + 0xFFF) & ~0xFFFull) - vkBase;
+    if (!AllocRegion(vkBase, vkSize, &s)) return false;
+    return true;
+}
+
+uint64_t Memory::AllocGuest(uint64_t size, uint32_t protFlags) {    const uint64_t page = 0x1000;
     const uint64_t gran  = 0x10000;    // гранула VirtualAlloc: кратность базы
     const uint64_t aligned = (size + page - 1) & ~(page - 1);
     for (int attempt = 0; attempt < 16; ++attempt) {

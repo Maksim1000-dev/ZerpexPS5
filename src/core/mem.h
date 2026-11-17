@@ -30,6 +30,11 @@ public:
     uint64_t Map(uint64_t vaddr, const uint8_t* data, uint64_t filesz,
                  uint64_t memsz, uint32_t protFlags);
 
+    // Фаза 7.2: резерв СПАН-а всего образа одним VirtualAlloc. Сегменты PS5
+    // примыкают внутри гранулы 64К и по отдельности наезжали друг на друга —
+    // теперь каждый сегмент ложится ВНУТРЬ общего резерва, без «переездов».
+    bool ReserveSpan(uint64_t base, uint64_t size);
+
     // Анонимная память без содержимого (sys_mmap). vaddr==0 запрещён —
     // для «где угодно» используй AllocGuest.
     uint64_t MapAnon(uint64_t vaddr, uint64_t size, uint32_t protFlags);
@@ -56,6 +61,11 @@ public:
 private:
     // Общий аллокатор региона. Возвращает базу региона или 0.
     uint64_t AllocRegion(uint64_t alignedBase, uint64_t size, MemSegment* out);
+
+    // Реестр ВЫДЕЛЕННЫХ РЕГИОНОВ (не сегментов): Map() ищет накрытие здесь,
+    // чтобы переиспользовать общий резерв вместо нового VirtualAlloc.
+    struct Region { uint64_t base = 0, size = 0; bool relocated = false; };
+    std::vector<Region> regions_;
     std::vector<MemSegment> segs_;
     uint64_t nextGuest_ = 0x0000700000000000ull;
 };
