@@ -232,6 +232,26 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 c->Rip += 2;             // ud2 — 2 байта; дальше в слоте стоит ret
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            // Фаза 7.5: импорт-АЛЛОКАТОР, опознанный ПО ПОВЕДЕНИЮ. Лог крэша
+            // 0x1A5B18F + дизассемблер: внутренний аллокатор libc 0x1b458d0(size)
+            // вызывает этот импорт и результат использует как указатель на
+            // структуру {self,self,self,0x101...}. Имя скремблировано SCE —
+            // честно даём гостевую память (выравнена на страницу, malloc-совместимо).
+            if (sym && std::strcmp(sym, "fJnpuVVBbKk#W#W") == 0 && g_mem) {
+                static std::atomic<uint64_t> nAlloc{0};
+                uint64_t gargs[8];
+                ReadGuestArgs(c, gargs);
+                const uint64_t sz = ((gargs[0] ? gargs[0] : 1) + 0xF) & ~0xFull;
+                const uint64_t p = g_mem->AllocGuest(sz, zrx::PF_R | zrx::PF_W);
+                const uint64_t n = nAlloc.fetch_add(1);
+                if (n < 8)
+                    printf("[EXEC] импорт-аллокатор fJnpuVVBbKk(size=%llu) -> guest 0x%llX\n",
+                           (unsigned long long)gargs[0], (unsigned long long)p);
+                fflush(stdout);
+                c->Rax = (DWORD64)p;
+                c->Rip += 2;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             static std::mutex smx;
             static std::set<std::string> once;
             bool first = false;
@@ -240,8 +260,13 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 first = once.insert(std::string(sym ? sym : "?")).second;
             }
             if (first) {
-                printf("[EXEC] ВЫЗОВ ИМПОРТА-ЗАГЛУШКИ: %s (реализации нет, гостю верну 0)\n",
-                       sym ? sym : "?");
+                // Фаза 7.5: адрес возврата ([rsp]) — чтобы мапить вызов на
+                // место в коде гостя (PLT-слот -> анализ оффлайн).
+                uint64_t ra = 0, retG = 0;
+                if (c->Rsp) memcpy(&ra, (const void*)(uintptr_t)c->Rsp, 8);
+                if (g_mem) g_mem->GuestForHost(ra, &retG);
+                printf("[EXEC] ВЫЗОВ ИМПОРТА-ЗАГЛУШКИ: %s (ret guest 0x%llX; реализации нет, гостю верну 0)\n",
+                       sym ? sym : "?", (unsigned long long)retG);
                 fflush(stdout);
             }
             c->Rax = 0;
@@ -265,6 +290,18 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
         const bool addrInGuest = g_mem && g_mem->GuestForHost(faultAddr, &guestAddr);
         if (inGuest || addrInGuest) {
             const bool isWrite = ep->ExceptionRecord->ExceptionInformation[0] != 0;
+            // Фаза 7.5: дамп байтов по guest RIP + регистры — крэш расшифровывается
+            // оффлайн (что читало/писало и откуда взялся ноль).
+            if (inGuest) {
+                const uint8_t* q = (const uint8_t*)(uintptr_t)(g_mem ? g_mem->Ptr(guestRip) : 0);
+                if (q)
+                    printf("[EXEC] байты @guest RIP: %02X %02X %02X %02X %02X %02X %02X %02X | "
+                           "RAX=0x%llX RBX=0x%llX RDX=0x%llX RDI=0x%llX\n",
+                           q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
+                           (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+                           (unsigned long long)c->Rdx, (unsigned long long)c->Rdi);
+                fflush(stdout);
+            }
             char buf[224];
             snprintf(buf, sizeof(buf),
                      "краш гостя: %s 0x%llX (guest 0x%llX) @ guest RIP 0x%llX (поток %llu)",
@@ -460,24 +497,34 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
         fflush(stdout);
     }
 
-    // --- Фаза 7.4: блок аргументов ядра (rdi на входе в entry) -------------------
-    // PS4/PS5-ядро передаёт entry указатель на свою структуру (rdi). Точную
-    // раскладку не имеем — строим честную гипотезу и ЛОГИРУЕМ: [0] = размер
-    // блока, [1] = база образа. Крэш гостя скажет, что он оттуда читал.
-    uint64_t argsV = 0;
+    // --- Фаза 7.4/7.5: блок аргументов ядра (rdi/rsi на входе в entry) ------------
+    // Реверс entry (disasm @0x400070): r14d=[rdi] — argc (u32!); r15 = rdi+8 —
+    // НАЧАЛО МАССИВА argv (идёт в main как rsi); rsi -> rbx уходит 2-му импорту
+    // (смысл неясен — даём пустой envp-массив). Блок: [0..4)=argc; [8)=argv[0];
+    // [16)=argv[1]=NULL. argv[0] = "/app0/eboot.bin" — как даёт PS5-ядро.
+    // (Старая гипотеза "size/base" врала: гость читал argc=0x100 из size-поля.)
+    uint64_t argsV = 0, envpV = 0;
     {
-        const uint64_t loadBase = entryVaddr - e.entry;   // e.entry уже с базой
-        argsV = mem.AllocGuest(0x100, zrx::PF_R | zrx::PF_W);
-        if (argsV && mem.Ptr(argsV)) {
-            uint64_t* a = (uint64_t*)(uintptr_t)mem.Ptr(argsV);
-            a[0] = 0x100;      // размер блока
-            a[1] = loadBase;   // база образа (гипотеза: указатель на ELF)
-            printf("[7.4] kernel-args @guest 0x%llX: [0]=0x%llX (size), [1]=0x%llX (база) "
-                   "— раскладка гипотеза, крэш уточнит\n",
-                   (unsigned long long)argsV, (unsigned long long)a[0],
-                   (unsigned long long)a[1]);
+        static const char kArgv0[] = "/app0/eboot.bin";
+        const uint64_t strV = mem.AllocGuest(sizeof(kArgv0) + 8, zrx::PF_R | zrx::PF_W);
+        if (strV && mem.Ptr(strV))
+            memcpy((void*)(uintptr_t)mem.Ptr(strV), kArgv0, sizeof(kArgv0));
+        argsV = mem.AllocGuest(0x40, zrx::PF_R | zrx::PF_W);
+        envpV = mem.AllocGuest(8, zrx::PF_R | zrx::PF_W);
+        if (argsV && mem.Ptr(argsV) && envpV && mem.Ptr(envpV)) {
+            uint8_t* p = (uint8_t*)(uintptr_t)mem.Ptr(argsV);
+            const uint32_t argc = 1;
+            const uint64_t a0 = strV, aEnd = 0, eNull = 0;
+            memcpy(p + 0, &argc, 4);          // argc (u32)
+            memcpy(p + 8, &a0, 8);            // argv[0] -> строка
+            memcpy(p + 16, &aEnd, 8);         // argv[1] = NULL
+            memcpy((void*)(uintptr_t)mem.Ptr(envpV), &eNull, 8);   // envp = {NULL}
+            printf("[7.4] kernel-args @guest 0x%llX: argc=1, argv[] в блоке (+8), "
+                   "argv[0]=0x%llX (\"%s\"), envp @0x%llX = {NULL}\n",
+                   (unsigned long long)argsV, (unsigned long long)strV, kArgv0,
+                   (unsigned long long)envpV);
         } else {
-            printf("[7.4] kernel-args не выделился — rdi = 0 (упадёт при чтении)\n");
+            printf("[7.4] kernel-args/envp не выделились — entry получит мусор\n");
         }
         fflush(stdout);
     }
@@ -492,9 +539,10 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
         printf("[EXEC] передача управления: entry 0x%llX -> хост 0x%llX (native x86-64)\n",
                (unsigned long long)entryVaddr, (unsigned long long)hostEntry);
         fflush(stdout);
-        // Гостевой entry — SysV ABI: rdi = kernel-args (фаза 7.4), rsi = 0.
-        using GuestMain = void (__attribute__((sysv_abi)) *)(uint64_t, void *);
-        ((GuestMain)(uintptr_t)hostEntry)(argsV, nullptr);
+        // Гостевой entry — SysV ABI: rdi = kernel-args (argc/argv, фаза 7.5),
+        // rsi = envp (пустой массив).
+        using GuestMain = void (__attribute__((sysv_abi)) *)(uint64_t, uint64_t);
+        ((GuestMain)(uintptr_t)hostEntry)(argsV, envpV);
         rr.exited = true;
         rr.exitCode = 0;
         rr.status = "entry вернулся через ret — гость завершился сам";
