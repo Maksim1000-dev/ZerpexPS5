@@ -10,7 +10,6 @@
 
 #include <windows.h>
 #include <process.h>       // _beginthreadex
-#include <setjmp.h>
 #include <cpuid.h>         // __get_cpuid_count (детект FSGSBASE, фаза 7.3)
 
 #include <atomic>
@@ -64,7 +63,6 @@ static std::atomic<uint64_t> g_nextTid { 2 };
 static std::atomic<int> g_threadsSpawned { 0 };
 
 // --- Состояние НА ПОТОК (гость многопоточный) --------------------------------
-static __thread jmp_buf t_jmp;
 static __thread volatile bool t_armed = false;
 static __thread char t_fault[256] = { 0 };
 static __thread int t_exitCode = 0;
@@ -79,48 +77,79 @@ static const int JMPL_EXIT        = 777;   // sys_exit (процесс)
 static const int JMPL_THREAD_EXIT = 888;   // sys_thr_exit (нить)
 static const int JMPL_FAULT       = -1;    // краш гостя (текст в t_fault)
 
-// Фаза 7.6.2: аварийная запись В ФАЙЛ лога мимо stdout-пайпа. Прогон 7.6.1:
-// последняя строка ("КРАШ ГОСТЯ: memcpy: ... len=") обрезана посреди строки и
-// после неё в zerpex_log.txt ничего — stdout-пайп (ти) встал, а printf в
-// полный пайп блокирует нить навсегда. Только kernel32 (CreateFileW/WriteFile)
-// — безопасно и из контекста исключения. Лог лежит рядом с EXE (как StartLogTee
-// в main.cpp).
-static void CrashAppendFile(const char* text) {
-    if (!text || !text[0]) return;
+// Фаза 7.6.2/7.7: запись в файл лога МИМО stdout-пайпа (только kernel32 —
+// безопасно и из контекста исключения). Лог лежит рядом с EXE (как StartLogTee
+// в main.cpp). Хэндл открывается ЗАРАНЕЕ (OpenCrashLog — main.cpp зовёт его
+// ДО StartLogTee): открытие в момент краша не сработало в прогоне 7.6.2
+// ([CRASH-FILE] отсутствовал при живом printf рядом — вероятен sharing
+// violation с хэндлом тира), поэтому открытие в момент краша больше не нужно.
+static HANDLE g_logDirect = nullptr;
+
+void OpenCrashLog() {
+    if (g_logDirect) return;
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring dir = exe;
     const size_t sl = dir.find_last_of(L"\\/");
     dir = (sl == std::wstring::npos) ? std::wstring(L".") : dir.substr(0, sl);
-    HANDLE h = CreateFileW((dir + L"\\zerpex_log.txt").c_str(), FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    SetFilePointer(h, 0, nullptr, FILE_END);
-    char buf[560];
-    const int k = snprintf(buf, sizeof(buf), "[CRASH-FILE] %s\r\n", text);
-    DWORD w = 0;
-    if (k > 0) WriteFile(h, buf, (DWORD)k, &w, nullptr);
-    CloseHandle(h);
+    g_logDirect = CreateFileW((dir + L"\\zerpex_log.txt").c_str(), FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (g_logDirect == INVALID_HANDLE_VALUE) g_logDirect = nullptr;
 }
 
-[[noreturn]] static void BailOut(int code, const char* text) {
-    t_fault[0] = 0;
-    if (text) {
-        snprintf(t_fault, sizeof(t_fault), "%s", text);
-        // Фаза 7.6.2: СНАЧАЛА файл (мимо пайпа), потом stdout — если пайп встал
-        // и printf заблокирует нить, диагноз уже лежит в zerpex_log.txt.
-        CrashAppendFile(t_fault);
-        // Фаза 7.6: диагноз печатается ДО longjmp — если размотка не дойдёт
-        // до [ИТОГ] в Run(), краш всё равно останется в логе (а не молча).
-        printf("[EXEC] КРАШ ГОСТЯ: %s\n", t_fault);
-        fflush(stdout);
-    }
+void AppendLogDirect(const char* text) {
+    if (!text || !text[0]) return;
+    if (!g_logDirect) OpenCrashLog();
+    if (!g_logDirect) return;
+    char buf[560];
+    const int k = snprintf(buf, sizeof(buf), "%s\r\n", text);
+    DWORD w = 0;
+    if (k > 0) WriteFile(g_logDirect, buf, (DWORD)k, &w, nullptr);
+}
+
+// Диагноз краша: СНАЧАЛА файл (мимо пайпа), потом stdout — если пайп встанет
+// и printf заблокирует нить, диагноз уже лежит в zerpex_log.txt.
+static void CrashReport(const char* text) {
+    if (!text || !text[0]) return;
+    snprintf(t_fault, sizeof(t_fault), "%s", text);
+    char line[600];
+    snprintf(line, sizeof(line), "[CRASH-FILE] %s", t_fault);
+    AppendLogDirect(line);
+    printf("[EXEC] КРАШ ГОСТЯ: %s\n", t_fault);
+    fflush(stdout);
+}
+
+// --- Фаза 7.7: аварийный выход БЕЗ longjmp ------------------------------------
+// GuestLaunch (launch.S) спилит callee-saved и запомнит блок в t_bailPtr.
+// VEH при краше в госте ПОДМЕНЯЕТ контекст (rsp/regs/rip) и возвращает
+// CONTINUE_EXECUTION: диспетчер завершается штатно (NtContinue), раскрутка
+// Windows по гостевым кадрам (без SEH-метаданных) не выполняется — именно
+// она роняла процесс в ntdll с 0xC00000FF (WER прогона 21:44 2026-11-17).
+// setjmp/longjmp из exec.cpp убраны полностью.
+static __thread void* t_bailPtr = nullptr;        // спил GuestLaunch
+static __thread volatile bool t_bailed = false;   // выход уже оформлен
+
+extern "C" void BailSaveBlock(void* p) { t_bailPtr = p; }
+
+extern "C" uint64_t GuestLaunch(uint64_t entry, uint64_t a1, uint64_t a2);
+
+// Подмена контекста на "GuestLaunch вернул code". Возвращает LONG для VEH.
+static LONG BailPatchContext(PCONTEXT c, int code) {
+    uint64_t* b = (uint64_t*)t_bailPtr;   // [r15 r14 r13 r12 rdi rsi rbp rbx ret]
+    c->R15 = b[0]; c->R14 = b[1]; c->R13 = b[2]; c->R12 = b[3];
+    c->Rdi = b[4]; c->Rsi = b[5]; c->Rbp = b[6]; c->Rbx = b[7];
+    c->Rip = b[8];                        // адрес возврата в Run/ThreadProc
+    c->Rsp = (DWORD64)t_bailPtr + 72;     // спил 8*8 + съеденный ret-адрес
+    c->Rax = (DWORD64)(int64_t)code;
     t_armed = false;
-    // Офлайн-тест tools/veh_bail_test.cpp: longjmp ПРЯМО из диспетчера на этом
-    // тулчейне ЖИВ (вернулись с v=100). Вариант "трамплин через подмену
-    // контекста" убивает процесс (0xC0000028, двойной диспетч) — НЕ использовать.
-    longjmp(t_jmp, code);
+    t_bailed = true;
+    {
+        char line[80];
+        snprintf(line, sizeof(line), "[BAILOUT] контекст подменён, код %d", code);
+        AppendLogDirect(line);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // Аргументы гостевого вызова (FreeBSD x64 / SysV): rdi,rsi,rdx,r10,r8,r9;
@@ -306,7 +335,7 @@ static uint64_t HeapCalloc(uint64_t n) {
     return q;
 }
 
-static uint64_t HeapMemmove(uint64_t dst, uint64_t src, uint64_t n) {
+static uint64_t HeapMemmove(PCONTEXT c, uint64_t dst, uint64_t src, uint64_t n) {
     if (!g_mem || !n) return dst;
     void* d = (void*)(uintptr_t)g_mem->Ptr(dst);
     void* s = (void*)(uintptr_t)g_mem->Ptr(src);
@@ -315,7 +344,12 @@ static uint64_t HeapMemmove(uint64_t dst, uint64_t src, uint64_t n) {
         snprintf(buf, sizeof(buf),
                  "memcpy: недоступная память dst=0x%llX src=0x%llX len=%llu",
                  (unsigned long long)dst, (unsigned long long)src, (unsigned long long)n);
-        BailOut(JMPL_FAULT, buf);
+        CrashReport(buf);
+        if (t_bailPtr) {
+            BailPatchContext(c, JMPL_FAULT);   // дальше код не пойдёт
+            return 0;
+        }
+        return 0;
     }
     memmove(d, s, (size_t)n);
     return dst;
@@ -367,12 +401,12 @@ static LONG WINAPI LastChanceFilter(EXCEPTION_POINTERS* ep) {
     printf("[CRASH] лог сохранён в build\\zerpex_log.txt\n");
     fflush(stdout);
     {
-        char cbuf[192];
+        char cbuf[208];
         snprintf(cbuf, sizeof(cbuf),
-                 "НЕПЕРЕХВАЧЕННОЕ 0x%08X @ host RIP 0x%llX (guest 0x%llX), адрес 0x%llX",
+                 "[CRASH-FILE] НЕПЕРЕХВАЧЕННОЕ 0x%08X @ host RIP 0x%llX (guest 0x%llX), адрес 0x%llX",
                  (unsigned)code, (unsigned long long)rip,
                  (unsigned long long)guestRip, (unsigned long long)fa);
-        CrashAppendFile(cbuf);   // 7.6.2: дубль в файл мимо пайпа
+        AppendLogDirect(cbuf);   // дубль в файл мимо пайпа
     }
     Sleep(400);   // дать фоновому тиру дописать хвост лога
     // Цепочка: дальше работает фильтр из main.cpp — он держит окно открытым.
@@ -415,8 +449,14 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
 
             if (r.status == hle::HleStatus::Exit) {
                 t_exitCode = r.exitCode;
-                if (t_tid == 1)
-                    BailOut(JMPL_EXIT, nullptr);     // к setjmp в Run()
+                if (t_tid == 1) {
+                    // Фаза 7.7: выход БЕЗ longjmp — подмена контекста, GuestLaunch
+                    // "вернёт" JMPL_EXIT в Run().
+                    printf("[EXEC] sys_exit(%d) из главного потока\n", r.exitCode);
+                    fflush(stdout);
+                    if (t_bailPtr) return BailPatchContext(c, JMPL_EXIT);
+                    ExitProcess((UINT)r.exitCode);
+                }
                 // sys_exit из нити: FreeBSD завершает весь процесс — честно.
                 printf("[EXEC] sys_exit(%d) из потока %llu — FreeBSD: завершаю процесс\n",
                        r.exitCode, (unsigned long long)t_tid);
@@ -425,7 +465,8 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             }
             if (r.status == hle::HleStatus::ThreadExit) {
                 t_exitCode = (int)r.ret;             // код sys_thr_exit
-                BailOut(JMPL_THREAD_EXIT, nullptr);  // вернёт в ThreadProc
+                if (t_bailPtr) return BailPatchContext(c, JMPL_THREAD_EXIT);
+                ExitProcess((UINT)(int)r.ret);
             }
             c->Rax = (DWORD64)r.ret;
             c->Rip += 2;                             // syscall и UD2 — обе по 2 байта
@@ -450,6 +491,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             if (sym && g_heapHost == nullptr && g_mem) HeapInit(*g_mem);
             if (sym && g_heapHost) {
                 uint64_t a[8];
+                t_bailed = false;    // 7.7: флаг "выход оформлен" живёт один вызов
                 ReadGuestArgs(c, a);
                 uint64_t res = 0;
                 bool hit = true;
@@ -461,7 +503,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                     // Офлайн-разбор строк вызовов снял гипотезы realloc/memalign.
                     res = HeapAllocAligned(16, a[0], "malloc");
                 }
-                else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(a[0], a[1], a[2]);
+                else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(c, a[0], a[1], a[2]);
                 else hit = false;
                 if (hit) {
                     static std::atomic<uint32_t> nH{0};
@@ -470,6 +512,11 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                                sym, (unsigned long long)a[0], (unsigned long long)a[1],
                                (unsigned long long)a[2], (unsigned long long)res);
                     fflush(stdout);
+                    if (t_bailed) {
+                        // Аварийный выход уже оформлен (memcpy по нулевому dst) —
+                        // контекст больше НЕ трогаем.
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
                     c->Rax = (DWORD64)res;
                     c->Rip += 2;             // ud2 — 2 байта; дальше в слоте ret
                     return EXCEPTION_CONTINUE_EXECUTION;
@@ -502,13 +549,42 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             snprintf(buf, sizeof(buf),
                      "гостевой UD2 (assert?) @ guest 0x%llX (поток %llu) — краш гостя",
                      (unsigned long long)guestRip, (unsigned long long)t_tid);
-            BailOut(JMPL_FAULT, buf);
+            CrashReport(buf);
+            if (t_bailPtr) return BailPatchContext(c, JMPL_FAULT);
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
     if (code == EXC_ACCESS) {
         const uint64_t faultAddr = ep->ExceptionRecord->ExceptionInformation[1];
+
+        // [7.7.1] Компат-хук u16-strcmp гостя (0x1A55450): таблицы имён содержат
+        // записи с name == NULL (не заполнены; анализ tools/scan_bail.c, scan2.c).
+        // Первый movzx [rdi] / [rsi] уходит в AV по адресу ~0. Точки входа:
+        // 0x1A55450 (movzx eax,[rdi]) и 0x1A55453 (movzx ecx,[rsi]); общая точка
+        // выхода 0x1A55486 (movzx ecx,cx; movzx eax,ax; sub eax,ecx; ret).
+        // Подменяем контекст: rax=1, rcx=0 -> возврат 1 = "не совпало". Все 5
+        // вызывающих после compare делают test eax; jz found; иначе идут к
+        // следующей записи цепочки — то есть NULL-запись просто не матчится,
+        // поиск вернёт not-found, и гость продолжит работу. Без патчей кода.
+        if (inGuest && faultAddr < 0x10000ull &&
+            (guestRip == 0x1A55450ull || guestRip == 0x1A55453ull)) {
+            static std::atomic<uint64_t> s_nullHits{0};
+            const uint64_t n = s_nullHits.fetch_add(1) + 1;
+            if (n <= 8 || (n % 1000) == 0) {
+                char pb[192];
+                snprintf(pb, sizeof(pb),
+                         "[COMPAT] u16-strcmp @0x1A55450: NULL-имя, пропуск записи #%llu (rdi=0x%llX rsi=0x%llX)\n",
+                         (unsigned long long)n,
+                         (unsigned long long)c->Rdi, (unsigned long long)c->Rsi);
+                AppendLogDirect(pb);
+            }
+            c->Rax = 1;
+            c->Rcx = 0;
+            c->Rip = 0x1A55486ull;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         uint64_t guestAddr = 0;
         const bool addrInGuest = g_mem && g_mem->GuestForHost(faultAddr, &guestAddr);
         if (inGuest || addrInGuest) {
@@ -532,7 +608,8 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                      (unsigned long long)faultAddr,
                      (unsigned long long)(addrInGuest ? guestAddr : 0),
                      (unsigned long long)guestRip, (unsigned long long)t_tid);
-            BailOut(JMPL_FAULT, buf);
+            CrashReport(buf);
+            if (t_bailPtr) return BailPatchContext(c, JMPL_FAULT);
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -542,7 +619,9 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
         snprintf(buf, sizeof(buf),
                  "привилегированная инструкция @ guest 0x%llX (поток %llu) — краш гостя",
                  (unsigned long long)guestRip, (unsigned long long)t_tid);
-        BailOut(JMPL_FAULT, buf);
+        CrashReport(buf);
+        if (t_bailPtr) return BailPatchContext(c, JMPL_FAULT);
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
     if (code == EXC_BREAK && inGuest) {
@@ -573,7 +652,8 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                  "исключение 0x%08X @ guest RIP 0x%llX (поток %llu), адрес 0x%llX (guest 0x%llX) — краш гостя",
                  (unsigned)code, (unsigned long long)guestRip, (unsigned long long)t_tid,
                  (unsigned long long)fa, (unsigned long long)gfa);
-        BailOut(JMPL_FAULT, buf);
+        CrashReport(buf);
+        if (t_bailPtr) return BailPatchContext(c, JMPL_FAULT);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -617,40 +697,44 @@ static unsigned __stdcall ThreadProc(void* p) {
     t_armed = true;
     t_fault[0] = 0;
     t_exitCode = 0;
+    t_bailed = false;
+    t_bailPtr = nullptr;
 
     const uint64_t hostEntry = g_mem ? g_mem->Translate(a->entry) : 0;
+    uint64_t rc = 0;
+    if (hostEntry) {
+        printf("[EXEC] поток %llu: entry guest 0x%llX -> host 0x%llX, arg=0x%llX\n",
+               (unsigned long long)t_tid,
+               (unsigned long long)a->entry,
+               (unsigned long long)hostEntry,
+               (unsigned long long)a->arg);
+        fflush(stdout);
+        // Фаза 7.7: тот же трамплин, что у main — без longjmp/раскрутки.
+        rc = GuestLaunch(hostEntry, a->arg, 0);
+    } else {
+        printf("[EXEC] поток %llu: entry 0x%llX не мапнут — нить не запущена\n",
+               (unsigned long long)t_tid, (unsigned long long)a->entry);
+    }
+    t_armed = false;
+    t_bailPtr = nullptr;
 
-    if (setjmp(t_jmp) == 0) {
-        if (hostEntry) {
-            printf("[EXEC] поток %llu: entry guest 0x%llX -> host 0x%llX, arg=0x%llX\n",
-                   (unsigned long long)t_tid,
-                   (unsigned long long)a->entry,
-                   (unsigned long long)hostEntry,
-                   (unsigned long long)a->arg);
-            fflush(stdout);
-            ((GuestFn)(uintptr_t)hostEntry)((void*)(uintptr_t)a->arg);
+    if (rc == 0) {
+        if (hostEntry)
             printf("[EXEC] поток %llu вернулся через ret — завершаю нить\n",
                    (unsigned long long)t_tid);
-            fflush(stdout);
-        } else {
-            printf("[EXEC] поток %llu: entry 0x%llX не мапнут — нить не запущена\n",
-                   (unsigned long long)t_tid, (unsigned long long)a->entry);
-            fflush(stdout);
-        }
+    } else if (t_fault[0]) {
+        printf("[EXEC] поток %llu остановлен: %s\n",
+               (unsigned long long)t_tid, t_fault);
     } else {
-        // longjmp: краш нити (sys_thr_exit приходит через JMPL_THREAD_EXIT)
-        if (t_fault[0]) {
-            printf("[EXEC] поток %llu остановлен: %s\n",
-                   (unsigned long long)t_tid, t_fault);
-            fflush(stdout);
-        }
+        printf("[EXEC] поток %llu остановлен (код %lld)\n",
+               (unsigned long long)t_tid, (long long)(int64_t)rc);
     }
+    fflush(stdout);
 
-    const unsigned rc = (unsigned)t_exitCode;
+    const unsigned rcv = (unsigned)t_exitCode;
     delete a;
-    t_armed = false;
-    _endthreadex(rc);
-    return rc;
+    _endthreadex(rcv);
+    return rcv;
 }
 
 uint64_t SpawnThread(uint64_t entryVaddr, uint64_t arg, uint64_t* tidOut) {
@@ -677,6 +761,7 @@ uint64_t CurrentTid() { return t_tid; }
 // --- Запуск главного потока гостя --------------------------------------------
 RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
     RunResult rr;
+    OpenCrashLog();   // 7.7: append-хэндл лога заранее (страховка; main зовёт раньше)
 
     const uint64_t hostEntry = mem.Translate(entryVaddr);
     if (!hostEntry) {
@@ -782,36 +867,39 @@ RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
     t_armed = true;
     t_fault[0] = 0;
     t_exitCode = 0;
+    t_bailed = false;
+    t_bailPtr = nullptr;
 
-    const int v = setjmp(t_jmp);
+    printf("[EXEC] передача управления: entry 0x%llX -> хост 0x%llX (native x86-64)\n",
+           (unsigned long long)entryVaddr, (unsigned long long)hostEntry);
+    fflush(stdout);
+    // Фаза 7.7: гость запускается через трамплин launch.S — спил callee-saved,
+    // вызов entry (SysV ABI: rdi = kernel-args фазы 7.5, rsi = envp). При краше
+    // VEH подменяет контекст и трамплин "возвращает" код — БЕЗ longjmp и без
+    // раскрутки Windows по гостевым кадрам (ntdll 0xC00000FF, WER 21:44).
+    const uint64_t v = GuestLaunch(hostEntry, argsV, envpV);
+    t_armed = false;
+    t_bailPtr = nullptr;
+
     if (v == 0) {
-        printf("[EXEC] передача управления: entry 0x%llX -> хост 0x%llX (native x86-64)\n",
-               (unsigned long long)entryVaddr, (unsigned long long)hostEntry);
-        fflush(stdout);
-        // Гостевой entry — SysV ABI: rdi = kernel-args (argc/argv, фаза 7.5),
-        // rsi = envp (пустой массив).
-        using GuestMain = void (__attribute__((sysv_abi)) *)(uint64_t, uint64_t);
-        ((GuestMain)(uintptr_t)hostEntry)(argsV, envpV);
         rr.exited = true;
         rr.exitCode = 0;
         rr.status = "entry вернулся через ret — гость завершился сам";
-    } else if (v == JMPL_EXIT) {
+    } else if (v == (uint64_t)JMPL_EXIT) {
         rr.exited = true;
         rr.exitCode = t_exitCode;
         char buf[96];
         snprintf(buf, sizeof(buf), "sys_exit(%d) — гость попросил выход", rr.exitCode);
         rr.status = buf;
-    } else if (v == JMPL_THREAD_EXIT) {
+    } else if (v == (uint64_t)JMPL_THREAD_EXIT) {
         rr.exited = false;
         rr.exitCode = t_exitCode;
         rr.status = "sys_thr_exit из главного потока — нить завершена";
     } else {
         rr.exited = false;
-        rr.exitCode = v;
+        rr.exitCode = (int)v;
         rr.status = t_fault[0] ? t_fault : "остановка без описания";
     }
-
-    t_armed = false;
     // ПАТЧИ НЕ ВОССТАНАВЛИВАЕМ и VEH НЕ СНИМАЕМ: нити гостя продолжают работу.
 
     if (g_threadsSpawned.load() > 0)

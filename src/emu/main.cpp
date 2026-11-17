@@ -304,6 +304,11 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
         return;
     }
     printf("[ИТОГ] %s\n", rr.status.c_str());
+    {   // 7.7: дубль [ИТОГ] в файл мимо пайпа — итог виден даже при мёртвом тире
+        char ib[256];
+        snprintf(ib, sizeof(ib), "[ИТОГ-FILE] %s", rr.status.c_str());
+        zrx::exec::AppendLogDirect(ib);
+    }
     printf("       exited=%s  код=%d\n", rr.exited ? "true" : "false", rr.exitCode);
     zrx::hle::PrintRunSummary();
     zrx::gpu::PrintRunSummary();
@@ -581,6 +586,7 @@ static void StartLogTee() {
 static int RealMain() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    zrx::exec::OpenCrashLog();   // 7.7: append-хэндл лога ДО тира — без sharing-рисков
     StartLogTee();
     printf("[ЛОГ] вывод дублируется в файл: zerpex_log.txt (рядом с EXE)\n");
 

@@ -49,4 +49,11 @@ uint64_t SpawnThread(uint64_t entryVaddr, uint64_t arg, uint64_t* tidOut);
 // tid текущего гостевого потока (0 = не в госте, 1 = главный поток)
 uint64_t CurrentTid();
 
+// Открыть append-хэндл файлового лога ЗАРАНЕЕ (зовётся из main до StartLogTee):
+// краш-записи идут через него без открытия в момент исключения (sharing-риски).
+void OpenCrashLog();
+
+// Записать строку в zerpex_log.txt НАПРЯМУЮ (kernel32, мимо stdout-пайпа).
+void AppendLogDirect(const char* text);
+
 } } // namespace zrx::exec
