@@ -4,13 +4,14 @@
 #include "exec.h"
 
 #include "../core/dyn.h"   // TryResolveStub (импорт-заглушки)
-#include "../core/elf.h"   // PF_X
+#include "../core/elf.h"   // PF_X, ElfImage (фаза 7.3: PT_TLS)
 #include "../core/hle.h"
 #include "gpu.h"           // GPU-модули (фаза 5): sceVideoOut*/sceGnm*
 
 #include <windows.h>
 #include <process.h>       // _beginthreadex
 #include <setjmp.h>
+#include <cpuid.h>         // __get_cpuid_count (детект FSGSBASE, фаза 7.3)
 
 #include <atomic>
 #include <condition_variable>
@@ -35,6 +36,29 @@ struct Patch {
 static std::vector<Patch> g_patches;
 static std::unordered_map<uint64_t, size_t> g_byHost;
 static Memory* g_mem = nullptr;
+
+// Фаза 7.3: флаг активного теста wrfsbase (см. DetectFsBase).
+static std::atomic<bool> g_fsTest{false};
+
+// Фаза 7.3: детект FSGSBASE. GCC не даёт __try в C++, поэтому тест под
+// СОБСТВЕННЫМ VEH (зарегистрирован в Run до вызова): при #UD обработчик
+// пропустит 5 байт инструкции. Прошла запись = fs-базу ставить умеем.
+// Вызывается ДО t_armed — VEH-ветка с g_fsTest стоит выше проверки t_armed.
+static void DetectFsBase() {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !(b & 1u)) {
+        hle::SetFsBaseSupported(false);
+        printf("[7.3] FSGSBASE: CPU не умеет — fs-база недоступна\n");
+        fflush(stdout);
+        return;
+    }
+    g_fsTest.store(true);
+    __builtin_ia32_wrfsbase64(0);
+    g_fsTest.store(false);
+    hle::SetFsBaseSupported(true);
+    printf("[7.3] FSGSBASE: доступен (CPU+ОС) — fs-базу ставить умеем\n");
+    fflush(stdout);
+}
 static void*   g_veh = nullptr;                   // живёт весь процесс
 static std::atomic<uint64_t> g_nextTid { 2 };
 static std::atomic<int> g_threadsSpawned { 0 };
@@ -144,6 +168,15 @@ static int64_t GpuExecuteOffVeh(const char* name, const uint64_t args[8]) {
 // --- VEH-обработчик ----------------------------------------------------------
 // Один на весь процесс; каждая гостевая нить фильтруется своим t_armed.
 static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
+    // Фаза 7.3: активен тест wrfsbase (DetectFsBase, до t_armed)? #UD значит
+    // "ОС не включила CR4.FSGSBASE": пропускаем инструкцию (5 байт) — это
+    // сам ответ теста, а не краш гостя.
+    if (g_fsTest.load()) {
+        g_fsTest.store(false);
+        ep->ContextRecord->Rip += 5;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     if (!t_armed) return EXCEPTION_CONTINUE_SEARCH;
 
     PCONTEXT c = ep->ContextRecord;
@@ -366,7 +399,7 @@ uint64_t SpawnThread(uint64_t entryVaddr, uint64_t arg, uint64_t* tidOut) {
 uint64_t CurrentTid() { return t_tid; }
 
 // --- Запуск главного потока гостя --------------------------------------------
-RunResult Run(Memory& mem, uint64_t entryVaddr) {
+RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e) {
     RunResult rr;
 
     const uint64_t hostEntry = mem.Translate(entryVaddr);
@@ -392,6 +425,40 @@ RunResult Run(Memory& mem, uint64_t entryVaddr) {
         }
     }
     // VEH остаётся на весь процесс: нити гостя живут дольше Run (фаза 4).
+
+    // --- Фаза 7.3: TLS/TCB ------------------------------------------------------
+    // Гость (FreeBSD ABI) держит TCB в fs. У x64 Windows fs свободна (TEB в gs),
+    // поэтому ставим fs сами — если CPU+ОС дают FSGSBASE. PT_TLS у Dead Cells
+    // пустой (filesz=0), но TCB нужен всегда: libc пишет в него ключи/dtv.
+    // Раскладка блока: [шаблон .tdata (round 0x40)][TCB 0x400]; self-указатель
+    // в TCB+0 (наш TCB — временный: libc обычно пере-ставляет fs через sysarch).
+    {
+        DetectFsBase();   // фаза 7.3: тест wrfsbase под нашим VEH
+        const zrx::ElfSegment* tls = nullptr;
+        for (const zrx::ElfSegment& p : e.phdrs)
+            if (p.type == zrx::PT_TLS) { tls = &p; break; }
+        const uint64_t tmplSz = tls ? ((tls->memsz + 0x3F) & ~0x3Full) : 0;
+        const uint64_t blockSz = tmplSz + 0x400;
+        const uint64_t blockV = mem.AllocGuest(blockSz, zrx::PF_R | zrx::PF_W);
+        if (blockV) {
+            const uint64_t tcbV = blockV + tmplSz;      // TCB сразу за шаблоном
+            uint8_t* p = (uint8_t*)(uintptr_t)mem.Ptr(blockV);
+            if (tls && tls->filesz && mem.Ptr(tls->vaddr))
+                memcpy(p, mem.Ptr(tls->vaddr), (size_t)tls->filesz);   // .tdata
+            memcpy(p + tmplSz, &tcbV, 8);               // tcb self @+0
+            if (hle::SetFsBase(tcbV))
+                printf("[7.3] TLS: TCB @guest 0x%llX, fs поставлен (шаблон %llu байт)\n",
+                       (unsigned long long)tcbV,
+                       (unsigned long long)(tls ? tls->filesz : 0));
+            else
+                printf("[7.3] TLS: TCB @guest 0x%llX выделен, НО fs поставить нельзя "
+                       "(FSGSBASE недоступен) — жду fs-крэш как диагностику\n",
+                       (unsigned long long)tcbV);
+        } else {
+            printf("[7.3] TLS: блок TCB не выделился\n");
+        }
+        fflush(stdout);
+    }
 
     t_tid = 1;
     t_armed = true;

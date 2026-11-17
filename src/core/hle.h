@@ -50,6 +50,14 @@ void SetGameRoot(const std::wstring& root);
 //   args[6..7] = хвост аргументов со стека гостя (rsp+8, rsp+16)
 HleResult Execute(uint32_t num, const uint64_t args[8]);
 
+// --- Фаза 7.3: база TLS (fs) для гостя ----------------------------------------
+// x64 Windows держит TEB в gs, fs у нас свободна — гость (FreeBSD ABI) кладёт
+// туда свой TCB. Доступно только при FSGSBASE (CPU умеет И ОС включила CR4 —
+// проверяем фактической записью под SEH, без неё wrfsbase = #UD).
+bool FsBaseAvailable();          // один раз детектится, дальше кэш
+bool SetFsBase(uint64_t v);      // false = недоступно (fs не меняем, честно)
+void SetFsBaseSupported(bool ok); // результат VEH-теста из exec (DetectFsBase)
+
 // Сводка после прогона: сколько каких вызовов было, что неизвестно.
 void PrintRunSummary();
 

@@ -26,6 +26,7 @@
 #include <string>
 
 #include "../core/mem.h"
+#include "../core/elf.h"   // ElfImage (фаза 7.3: PT_TLS в Run)
 
 namespace zrx {
 namespace exec {
@@ -37,8 +38,9 @@ struct RunResult {
     std::string status;           // человекочитаемый итог (честный)
 };
 
-// Патчит syscall'ы, ставит VEH, передаёт управление entry и разбирает результат.
-RunResult Run(Memory& mem, uint64_t entryVaddr);
+// Патчит syscall'ы, ставит VEH, ставит TCB+fs (фаза 7.3), передаёт управление
+// entry и разбирает результат. Нужен разбор ELF: PT_TLS и раскладка сегментов.
+RunResult Run(Memory& mem, uint64_t entryVaddr, const ElfImage& e);
 
 // Создать гостевой поток (sys_thr_create): нить Windows исполняет
 // start(arg) по гостевому vaddr. Возвращает гостевой tid или 0 при ошибке.

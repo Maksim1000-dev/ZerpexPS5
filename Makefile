@@ -8,7 +8,7 @@ GCC_DIR  := GCC
 CXX      := $(GCC_DIR)/bin/g++.exe
 IMGUI    := imgui-1.93.0/imgui-1.93.0
 
-CXXFLAGS := -std=c++17 -O2 -m64 -Wall -DUNICODE -D_UNICODE \
+CXXFLAGS := -std=c++17 -O2 -m64 -Wall -mfsgsbase -DUNICODE -D_UNICODE \
             -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000 \
             -I$(IMGUI) -I$(IMGUI)/backends -Isrc
 

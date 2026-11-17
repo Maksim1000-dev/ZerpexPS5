@@ -291,7 +291,7 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
     printf("\n  [фаза 4] перехват: syscall (0F 05) -> UD2 (0F 0B) + VEH, потоки, файлы.\n");
     printf("  Конвенция: rax=номер, аргументы rdi,rsi,rdx,r10,r8,r9 (+хвост на стеке).\n\n");
 
-    zrx::exec::RunResult rr = zrx::exec::Run(mem, e.entry);
+    zrx::exec::RunResult rr = zrx::exec::Run(mem, e.entry, e);
     Line();
     if (!rr.started) {
         printf("[ИТОГ] запуск НЕ состоялся: %s\n", rr.status.c_str());

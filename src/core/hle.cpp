@@ -224,6 +224,23 @@ static int g_nextFd = 3;                     // 0/1/2 — консоль
 
 void AttachMemory(Memory* mem) { g_mem = mem; }
 
+// --- Фаза 7.3: fs-база гостя --------------------------------------------------
+// Тест FSGSBASE делаем в exec.cpp (там живёт VEH — GCC не даёт __try в C++).
+// Здесь только флаг и сама запись. На x64 Windows fs свободна (TEB в gs).
+static int g_fsAvail = 0;   // 0/1; ставится exec::DetectFsBase через SetFsBaseSupported
+
+static void WrFsBaseRaw(uint64_t v) { __builtin_ia32_wrfsbase64(v); }
+
+void SetFsBaseSupported(bool ok) { g_fsAvail = ok ? 1 : 0; }
+
+bool FsBaseAvailable() { return g_fsAvail == 1; }
+
+bool SetFsBase(uint64_t v) {
+    if (!FsBaseAvailable()) return false;
+    WrFsBaseRaw(v);
+    return true;
+}
+
 void SetGameRoot(const std::wstring& root) { g_root = root; }
 
 static void LogCall(uint32_t num, const uint64_t args[8], const char* name) {
@@ -728,8 +745,20 @@ HleResult Execute(uint32_t num, const uint64_t args[8]) {
         return { HleStatus::Handled, 0, 0 };
     }
 
-    case 165: { // sys_sysarch(op, parms) — операции не поддерживаем, отвечаем 0
+    case 165: { // sys_sysarch(op, parms) — FreeBSD amd64: 0=GET_FSBASE, 1=SET_FSBASE,
+                // 2=GET_GSBASE, 3=SET_GSBASE. Фаза 7.3: SET_FSBASE работаем честно.
         LogCall(num, args, known);
+        if (args[0] == 1) {   // SET_FSBASE
+            if (SetFsBase(args[1]))
+                return { HleStatus::Handled, 0, 0 };
+            printf("[HLE] sysarch(SET_FSBASE, 0x%llX): FSGSBASE недоступен — fs не меняем, "
+                   "гость упадёт на первом fs-доступе (это диагностика)\n",
+                   (unsigned long long)args[1]);
+            return { HleStatus::Handled, 0, 0 };
+        }
+        if (args[0] == 3)     // SET_GSBASE: у x64 Windows gs занят TEB'ом
+            printf("[HLE] sysarch(SET_GSBASE, 0x%llX): gs занят Windows — игнорируем честно\n",
+                   (unsigned long long)args[1]);
         return { HleStatus::Handled, 0, 0 };
     }
 
