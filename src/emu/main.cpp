@@ -18,6 +18,8 @@
 // ============================================================================
 #include <windows.h>
 #include <shellapi.h>
+#include <io.h>            // _dup/_dup2/_open_osfhandle (фаз 7.5.1: файловый лог)
+#include <fcntl.h>         // _O_WRONLY
 
 #include <filesystem>
 #include <fstream>
@@ -506,9 +508,70 @@ static void TryRunSelf(const std::wstring& path, const zrx::analyze::SelfReport&
 // ----------------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Фаза 7.5.1: файловый лог. Весь stdout идёт и в консоль, и в
+// zerpex_log.txt рядом с EXE (перезаписывается при каждом старте).
+// Механика: fd 1 подменяется на пайп (_dup2), фоновая нить читает пайп
+// и пишет в сохранённый консольный хэндл + файл. stdout без буфера,
+// чтобы консоль оставалась «живой».
+// ----------------------------------------------------------------------------
+static HANDLE g_logConsole = nullptr;
+static HANDLE g_logPipeRd   = nullptr;
+static FILE*  g_logFile     = nullptr;
+
+static DWORD WINAPI LogTeeProc(LPVOID) {
+    char buf[4096];
+    DWORD n = 0;
+    for (;;) {
+        if (!ReadFile(g_logPipeRd, buf, sizeof(buf), &n, nullptr) || !n) break;
+        if (g_logConsole) {
+            DWORD w = 0;
+            WriteFile(g_logConsole, buf, n, &w, nullptr);
+        }
+        if (g_logFile) {
+            fwrite(buf, 1, n, g_logFile);
+            fflush(g_logFile);
+        }
+    }
+    return 0;
+}
+
+static void StartLogTee() {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = exe;
+    const size_t s = dir.find_last_of(L"\\/");
+    dir = (s == std::wstring::npos) ? std::wstring(L".") : dir.substr(0, s);
+    const std::wstring path = dir + L"\\zerpex_log.txt";
+
+    const int realFd = _dup(1);     // консольное stdout дублируем на свой fd
+    g_logConsole = (realFd >= 0) ? (HANDLE)(uintptr_t)_get_osfhandle(realFd) : nullptr;
+
+    SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+    HANDLE wr = nullptr;
+    if (!CreatePipe(&g_logPipeRd, &wr, &sa, 0)) return;
+    const int pipeFd = _open_osfhandle((intptr_t)wr, _O_WRONLY);
+    if (pipeFd < 0) { CloseHandle(g_logPipeRd); CloseHandle(wr); return; }
+    _dup2(pipeFd, 1);
+    _close(pipeFd);
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    g_logFile = _wfopen(path.c_str(), L"w");
+    if (g_logFile) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(g_logFile, "ZerpexPS5 log | %04u-%02u-%02u %02u:%02u:%02u\r\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        fflush(g_logFile);
+    }
+    CreateThread(nullptr, 0, &LogTeeProc, nullptr, 0, nullptr);
+}
+
 static int RealMain() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    StartLogTee();
+    printf("[ЛОГ] вывод дублируется в файл: zerpex_log.txt (рядом с EXE)\n");
 
     int argcW = 0;
     LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argcW);
