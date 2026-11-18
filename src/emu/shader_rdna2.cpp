@@ -230,8 +230,12 @@ struct Builder {
         std::vector<uint32_t> ep;
         ep.push_back(isVertex ? SPV_ExecVertex : SPV_ExecFragment);
         ep.push_back(fnId);
-        // "main"
+        // "main" — UTF-8 с завершающим нулём, выравнивается до 4 байт:
+        // 5 байт = ДВА слова (0x6E69616D + 0x00000000). Без второго слова
+        // парсер съедал первый id интерфейса как хвост строки, и драйвер
+        // отвергал модуль на компиляции пайплайна (VK_ERROR_UNKNOWN -13).
         ep.push_back(0x6E69616D);
+        ep.push_back(0);
         if (isVertex) { ep.push_back(varVid); ep.push_back(varPos); }
         else          { ep.push_back(varCol); }
         emit(head, SPV_OpEntryPoint, ep.data(), ep.size());

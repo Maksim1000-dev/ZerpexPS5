@@ -918,6 +918,23 @@ static const uint32_t kFsRdna2[] = {
     0xBF810000,             // S_ENDPGM
 };
 
+// Дамп SPIR-V рядом с EXE — диагностика без запуска эмулятора:
+// после прогона можно прогнать spirv-val по реальным байтам.
+static void DumpSpv(const wchar_t* name, const std::vector<uint32_t>& spv) {
+    if (spv.empty()) return;
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring p = exe;
+    const size_t s = p.find_last_of(L"\\/");
+    if (s == std::wstring::npos) return;
+    p = p.substr(0, s + 1) + name;
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) return;
+    fwrite(spv.data(), 4, spv.size(), f);
+    fclose(f);
+    printf("[GPU]   SPIR-V сохранён: %ls (%u слов)\n", name, (unsigned)spv.size());
+}
+
 static bool InitPm4Pipeline() {
     if (g_pmReady) return true;
     if (g_pmFailed) return false;
@@ -934,6 +951,7 @@ static bool InitPm4Pipeline() {
     if (rdna2::Translate(reinterpret_cast<const uint8_t*>(kVsRdna2),
                          sizeof(kVsRdna2), true, &tr)) {
         s_vsGen = tr.spirv;
+        DumpSpv(L"zerpex_vs.spv", s_vsGen);
         sci.pCode    = s_vsGen.data();
         sci.codeSize = s_vsGen.size() * 4;
         if (pCreateShader(g_dev, &sci, nullptr, &g_pmVs) == VK_SUCCESS) {
@@ -964,6 +982,7 @@ static bool InitPm4Pipeline() {
     if (rdna2::Translate(reinterpret_cast<const uint8_t*>(kFsRdna2),
                          sizeof(kFsRdna2), false, &tr)) {
         s_fsGen = tr.spirv;
+        DumpSpv(L"zerpex_fs.spv", s_fsGen);
         sci.pCode    = s_fsGen.data();
         sci.codeSize = s_fsGen.size() * 4;
         if (pCreateShader(g_dev, &sci, nullptr, &g_pmFs) == VK_SUCCESS) {
@@ -1117,7 +1136,36 @@ static bool InitPm4Pipeline() {
     pci.layout              = g_pmLayout;
     pci.renderPass          = g_pmPass;
     pci.subpass             = 0;
-    const VkResult pr = pCreatePipelines(g_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pmPipe);
+    VkResult pr = pCreatePipelines(g_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pmPipe);
+    if (pr != VK_SUCCESS && (vsGen || fsGen)) {
+        // Страховка: транслятор собрал модули, но драйвер их не скомпилировал.
+        // Один раз пробуем рукописные SPIR-V — кадр важнее амбиций.
+        printf("[GPU]   пайплайн с SPIR-V транслятора не собрался (VkResult %d) —"
+               " пробую рукописные шейдеры\n", (int)pr);
+        fflush(stdout);
+        if (g_pmVs) { pDestroyShader(g_dev, g_pmVs, nullptr); g_pmVs = VK_NULL_HANDLE; }
+        if (g_pmFs) { pDestroyShader(g_dev, g_pmFs, nullptr); g_pmFs = VK_NULL_HANDLE; }
+        sci.pCode    = kVsSpirv;
+        sci.codeSize = sizeof(kVsSpirv);
+        if (pCreateShader(g_dev, &sci, nullptr, &g_pmVs) != VK_SUCCESS) {
+            printf("[GPU]   рукописный вершинный SPIR-V отклонён драйвером\n");
+            fflush(stdout);
+            g_pmFailed = true; return false;
+        }
+        sci.pCode    = kFsSpirv;
+        sci.codeSize = sizeof(kFsSpirv);
+        if (pCreateShader(g_dev, &sci, nullptr, &g_pmFs) != VK_SUCCESS) {
+            printf("[GPU]   рукописный фрагментный SPIR-V отклонён драйвером\n");
+            fflush(stdout);
+            g_pmFailed = true; return false;
+        }
+        stages[0].module = g_pmVs;
+        stages[1].module = g_pmFs;
+        pr = pCreatePipelines(g_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pmPipe);
+        if (pr == VK_SUCCESS)
+            printf("[GPU]   [5.3] пайплайн собран на рукописном фолбэке\n");
+        fflush(stdout);
+    }
     if (pr != VK_SUCCESS) {
         printf("[GPU]   vkCreateGraphicsPipelines не удался: VkResult %d\n", (int)pr);
         fflush(stdout);
