@@ -822,6 +822,28 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
+        // [7.7.4] Список инициализаторов/GC (0x24C2138/0x24C2140): запись
+        // 0x200 — заведомо не указатель. Пропускаем её тем же способом, что и
+        // NULL-имя в u16-strcmp: r15++ -> continue. Один раз дампим список,
+        // чтобы в логе осталась причина. Не больше 8 пропусков на прогон.
+        if (inGuest && faultAddr < 0x10000ull && guestRip == 0x1A2C9D3ull &&
+            c->Rax < 0x10000ull) {
+            static std::atomic<uint32_t> s_skipBad{0};
+            const uint32_t n = s_skipBad.fetch_add(1) + 1;
+            if (n == 1) DumpCrashDiagnostics();
+            if (n <= 8) {
+                char sb[208];
+                snprintf(sb, sizeof(sb),
+                         "[COMPAT] 0x1A2C9D3: битая запись списка #%u = 0x%llX "
+                         "(индекс %llu), пропускаю",
+                         n, (unsigned long long)c->Rax,
+                         (unsigned long long)c->R15);
+                DiagLine(sb);
+                c->Rip = 0x1A2C9C0ull;   // inc r15; cmp r15,count; jl loop
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
         uint64_t guestAddr = 0;
         const bool addrInGuest = g_mem && g_mem->GuestForHost(faultAddr, &guestAddr);
         if (inGuest || addrInGuest) {
