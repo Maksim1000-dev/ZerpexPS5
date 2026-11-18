@@ -275,7 +275,9 @@ static void DumpCrashDiagnostics() {
              (int)cnt, (unsigned long long)data);
     DiagLine(line);
     const uint8_t* arr = (g_mem && data) ? g_mem->Ptr(data) : nullptr;
-    const int shown = (cnt > 0 && cnt < 128) ? cnt : 0;
+    const int shown = cnt > 0 ? (cnt < 64 ? cnt : 64) : 0;
+    if (cnt > 64)
+        DiagLine("[AV-DUMP]   (count больше 64 — печатаю первые 64)");
     for (int i = 0; arr && i < shown; ++i) {
         uint64_t e = 0;
         memcpy(&e, arr + i * 8, 8);
