@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 namespace zrx {
 namespace exec {
@@ -110,6 +111,7 @@ void AppendLogDirect(const char* text) {
 
 // Диагноз краша: СНАЧАЛА файл (мимо пайпа), потом stdout — если пайп встанет
 // и printf заблокирует нить, диагноз уже лежит в zerpex_log.txt.
+static void DumpCrashDiagnostics();   // 7.7.3, определён ниже
 static void CrashReport(const char* text) {
     if (!text || !text[0]) return;
     snprintf(t_fault, sizeof(t_fault), "%s", text);
@@ -118,6 +120,184 @@ static void CrashReport(const char* text) {
     AppendLogDirect(line);
     printf("[EXEC] КРАШ ГОСТЯ: %s\n", t_fault);
     fflush(stdout);
+    DumpCrashDiagnostics();
+}
+
+// --- Фаза 7.7.3: след последних импортов -------------------------------------
+// При краше видно, ЧТО гость успел позвать перед падением. Запись без
+// блокировок: слот заполняется, seq публикуется последним. Дамп может поймать
+// одну "рваную" запись при гонке нитей — имя и аргументы всё равно видны.
+struct ImpTrace {
+    char     name[64];
+    uint64_t a[3];
+    uint64_t ret;
+    uint64_t ra;      // guest-адрес возврата (место вызова)
+    uint64_t seq;
+};
+static ImpTrace g_impTrace[64];
+static std::atomic<uint64_t> g_impSeq{0};
+
+// 7.7.3: перепись импортов — кто сколько раз звался и чем закончился.
+// Нереализованные (resolved=false) при краше печатаются по частоте: это
+// готовый список того, что мешает игре, без ручного разбора лога.
+struct ImpStat {
+    uint64_t count = 0;
+    uint64_t ra = 0;
+    uint64_t a[3] = {};
+    uint64_t ret = 0;
+    bool     resolved = false;
+};
+static std::mutex g_impStatMx;
+static std::unordered_map<std::string, ImpStat> g_impStats;
+
+static uint64_t GuestRet(PCONTEXT c) {
+    if (!c || !c->Rsp || !g_mem) return 0;
+    uint64_t ra = 0, g = 0;
+    const uint8_t* p = g_mem->Ptr(c->Rsp);
+    if (!p) return 0;
+    memcpy(&ra, p, 8);
+    return g_mem->GuestForHost(ra, &g) ? g : ra;
+}
+
+static void TraceImport(PCONTEXT c, const char* name, const uint64_t a[8],
+                        uint64_t ret, bool resolved) {
+    const uint64_t n = g_impSeq.fetch_add(1, std::memory_order_relaxed);
+    ImpTrace& t = g_impTrace[n & 63];
+    t.seq = 0;                                   // слот "занят"
+    snprintf(t.name, sizeof(t.name), "%s", name ? name : "?");
+    t.a[0] = a[0]; t.a[1] = a[1]; t.a[2] = a[2];
+    t.ret  = ret;
+    t.ra   = GuestRet(c);
+    std::atomic_thread_fence(std::memory_order_release);
+    t.seq = n + 1;
+
+    std::lock_guard<std::mutex> lk(g_impStatMx);
+    ImpStat& s = g_impStats[name ? name : "?"];
+    if (!s.count) {
+        s.ra = t.ra;
+        s.a[0] = a[0]; s.a[1] = a[1]; s.a[2] = a[2];
+    }
+    s.count++;
+    s.ret = ret;
+    s.resolved = s.resolved || resolved;
+}
+
+// Строка сразу в файл (мимо пайпа) и в stdout — для аварийной диагностики.
+static void DiagLine(const char* text) {
+    if (!text || !text[0]) return;
+    AppendLogDirect(text);
+    printf("%s\n", text);
+    fflush(stdout);
+}
+
+static void DumpGuestQwords(const char* label, uint64_t addr, int count) {
+    char line[256];
+    const uint8_t* p = (g_mem && addr) ? g_mem->Ptr(addr) : nullptr;
+    snprintf(line, sizeof(line), "[AV-DUMP] %s @0x%llX%s",
+             label, (unsigned long long)addr, p ? ":" : ": НЕДОСТУПНО");
+    DiagLine(line);
+    if (!p) return;
+    for (int i = 0; i < count; i += 4) {
+        char vals[160] = {};
+        int off = 0;
+        for (int k = 0; k < 4 && i + k < count; ++k) {
+            uint64_t q = 0;
+            memcpy(&q, p + (i + k) * 8, 8);
+            off += snprintf(vals + off, sizeof(vals) - off, " %016llX",
+                            (unsigned long long)q);
+        }
+        snprintf(line, sizeof(line), "[AV-DUMP]   +0x%03X:%s", (i * 8), vals);
+        DiagLine(line);
+    }
+}
+
+// Один раз на краш: последние 32 импорта + ключевые глобалы реестра/таблиц.
+static void DumpCrashDiagnostics() {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) return;
+    const uint64_t last = g_impSeq.load(std::memory_order_acquire);
+    char line[256];
+    snprintf(line, sizeof(line), "[AV-DUMP] последние импорты (всего %llu), от старых к новым:",
+             (unsigned long long)last);
+    DiagLine(line);
+    const uint64_t first = last > 32 ? last - 32 : 1;
+    for (uint64_t s = first; s <= last; ++s) {
+        const ImpTrace& t = g_impTrace[(s - 1) & 63];
+        if (t.seq != s) continue;                // слот уже перезаписан
+        snprintf(line, sizeof(line),
+                 "[AV-DUMP]   #%llu %s(0x%llX, 0x%llX, 0x%llX) -> 0x%llX, ret 0x%llX",
+                 (unsigned long long)s, t.name,
+                 (unsigned long long)t.a[0], (unsigned long long)t.a[1],
+                 (unsigned long long)t.a[2], (unsigned long long)t.ret,
+                 (unsigned long long)t.ra);
+        DiagLine(line);
+    }
+
+    // Перепись нереализованных импортов — по частоте, с первым местом вызова.
+    struct Row { uint64_t n; std::string name; uint64_t ra, a0, a1, a2, ret; };
+    std::vector<Row> rows;
+    {
+        std::lock_guard<std::mutex> lk(g_impStatMx);
+        for (const auto& kv : g_impStats)
+            if (!kv.second.resolved)
+                rows.push_back({ kv.second.count, kv.first, kv.second.ra,
+                                 kv.second.a[0], kv.second.a[1], kv.second.a[2],
+                                 kv.second.ret });
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& x, const Row& y) { return x.n > y.n; });
+    snprintf(line, sizeof(line), "[AV-DUMP] нереализованные импорты: %u видов",
+             (unsigned)rows.size());
+    DiagLine(line);
+    for (size_t i = 0; i < rows.size() && i < 60; ++i) {
+        const Row& r = rows[i];
+        snprintf(line, sizeof(line),
+                 "[AV-DUMP]   x%llu %s(0x%llX, 0x%llX, 0x%llX) -> 0x%llX, ret 0x%llX",
+                 (unsigned long long)r.n, r.name.c_str(),
+                 (unsigned long long)r.a0, (unsigned long long)r.a1,
+                 (unsigned long long)r.a2, (unsigned long long)r.ret,
+                 (unsigned long long)r.ra);
+        DiagLine(line);
+    }
+    DumpGuestQwords("глобал count [0x24C6138]", 0x24C6138ull, 4);
+    DumpGuestQwords("глобал data  [0x24C6140]", 0x24C6140ull, 4);
+    // Настоящий список инициализаторов: count @0x24C2138, массив @0x24C2140.
+    // Печатаем каждую запись и её первые qword'ы, если это валидный указатель:
+    // так сразу видно, какая запись равна 0x200 и кто её туда положил.
+    int32_t cnt = 0;
+    uint64_t data = 0;
+    if (g_mem) {
+        if (const uint8_t* p = g_mem->Ptr(0x24C2138ull)) memcpy(&cnt, p, 4);
+        if (const uint8_t* p = g_mem->Ptr(0x24C2140ull)) memcpy(&data, p, 8);
+    }
+    snprintf(line, sizeof(line),
+             "[AV-DUMP] список инициализаторов: count=%d data=0x%llX",
+             (int)cnt, (unsigned long long)data);
+    DiagLine(line);
+    const uint8_t* arr = (g_mem && data) ? g_mem->Ptr(data) : nullptr;
+    const int shown = (cnt > 0 && cnt < 128) ? cnt : 0;
+    for (int i = 0; arr && i < shown; ++i) {
+        uint64_t e = 0;
+        memcpy(&e, arr + i * 8, 8);
+        const uint8_t* q = (g_mem && e) ? g_mem->Ptr(e) : nullptr;
+        if (q) {
+            uint64_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+            memcpy(&w0, q, 8); memcpy(&w1, q + 8, 8);
+            memcpy(&w2, q + 16, 8); memcpy(&w3, q + 24, 8);
+            snprintf(line, sizeof(line),
+                     "[AV-DUMP]   [%d] = 0x%llX -> %016llX %016llX %016llX %016llX",
+                     i, (unsigned long long)e, (unsigned long long)w0,
+                     (unsigned long long)w1, (unsigned long long)w2,
+                     (unsigned long long)w3);
+        } else {
+            snprintf(line, sizeof(line),
+                     "[AV-DUMP]   [%d] = 0x%llX  <-- НЕ УКАЗАТЕЛЬ", i,
+                     (unsigned long long)e);
+        }
+        DiagLine(line);
+    }
+    DumpGuestQwords("blocks 0x24C41F0", 0x24C41F0ull, 24);
+    DumpGuestQwords("blocks 0x24C4310", 0x24C4310ull, 24);
 }
 
 // --- Фаза 7.7: аварийный выход БЕЗ longjmp ------------------------------------
@@ -529,7 +709,9 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             if (sym && gpu::Handles(sym)) {
                 uint64_t gargs[8];
                 ReadGuestArgs(c, gargs);
-                c->Rax = (DWORD64)GpuExecuteOffVeh(sym, gargs);
+                const uint64_t gres = (uint64_t)GpuExecuteOffVeh(sym, gargs);
+                TraceImport(c, sym, gargs, gres, true);
+                c->Rax = (DWORD64)gres;
                 c->Rip += 2;             // ud2 — 2 байта; дальше в слоте стоит ret
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -555,6 +737,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 else if (!std::strcmp(sym, kImpMemmove)) res = HeapMemmove(c, a[0], a[1], a[2]);
                 else hit = false;
                 if (hit) {
+                    TraceImport(c, sym, a, res, true);
                     static std::atomic<uint32_t> nH{0};
                     if (nH.fetch_add(1) < 14)
                         printf("[EXEC] libc %s(0x%llX, 0x%llX, 0x%llX) -> 0x%llX\n",
@@ -588,7 +771,10 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                        sym ? sym : "?", (unsigned long long)retG);
                 fflush(stdout);
             }
+            uint64_t ua[8];
+            ReadGuestArgs(c, ua);
             c->Rax = 0;
+            TraceImport(c, sym ? sym : "?", ua, 0, false);
             c->Rip += 2;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
