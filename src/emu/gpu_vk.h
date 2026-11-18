@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace zrx {
 namespace gpu_vk {
@@ -51,5 +52,14 @@ int Probe(int which);
 
 // true, если Vulkan-устройство реально найдено (для честных сообщений)
 bool DeviceAlive();
+
+// --- Сплаш "как у Unity": иконка игры + подпись (GDI, тот же HWND) -----------
+// Показывается до первого кадра гостя; когда Vulkan поднимается (Prepare),
+// содержимое окна сменяется на вывод игры — окно одно и то же.
+bool SplashOpen(const std::wstring& iconPath, const std::wstring& subtitle);
+void SplashPump();          // насос сообщений, пока ждём игру
+bool SplashActive();        // сплаш на экране и окно живо
+void SplashEnd();           // снять сплаш (Vulkan сам перерисует содержимое)
+bool WindowOpen();          // окно создано и не закрыто пользователем
 
 } } // namespace zrx::gpu_vk

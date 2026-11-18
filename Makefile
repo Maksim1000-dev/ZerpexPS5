@@ -32,7 +32,7 @@ LAUNCHER_OUT := build/ZerpexLauncher.exe
 
 # --- Ядро эмулятора: консольное приложение (фаза 5) ---
 EMU_LDFLAGS := -m64 -static -static-libgcc -static-libstdc++
-EMU_LIBS    := -lshell32
+EMU_LIBS    := -lshell32 -lwindowscodecs -lole32 -luuid -lgdi32
 
 # Vulkan SDK (фаза 5): хедеры Khronos из локального SDK; DLL — системная,
 # линковки нет (LoadLibrary в рантайме). Если SDK нет — gpu_vk.cpp

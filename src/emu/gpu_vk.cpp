@@ -1,5 +1,5 @@
 // ============================================================================
-// ZerpexPS5 — фаза 5.0: Vulkan-слой (окно + свапчейн + копия кадра)
+// ZerpexPS5 — фазы 5.0–5.3: Vulkan-слой (окно + сплаш + свапчейн + PM4)
 //
 // Что делает честно:
 //   - грузит vulkan-1.dll динамически (линковки нет, SDK нужен только для
@@ -13,12 +13,15 @@
 // ============================================================================
 #include "gpu_vk.h"
 #include "shader_rdna2.h"
+#include "../version.h"
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <windows.h>
+#include <wincodec.h>
 
 #if defined(__has_include)
 #  if __has_include(<vulkan/vulkan.h>)
@@ -171,9 +174,136 @@ static PFN_vkCmdBindVertexBuffers              pCmdBindVb;
          if (!(var)) { printf("[GPU] Vulkan: функция %s не найдена\n", #name); \
                       fflush(stdout); return false; } } while (0)
 
+// --- Сплаш "как у Unity": иконка игры + подпись ------------------------------
+// До первого кадра гостя окно показывает иконку и "RUNNED WITH ZerpexPS5".
+// Когда Vulkan поднимается (Prepare), тот же HWND переключается на вывод игры.
+static bool         g_splash    = false;
+static HBITMAP      g_splashBmp = nullptr;
+static int          g_splashW   = 0;
+static int          g_splashH   = 0;
+static std::wstring g_splashSub;
+
+// PNG -> DIB-секция BGRA; альфа компонуется поверх цвета фона bg (0x00BBGGRR),
+// поэтому StretchBlt показывает картинку без "чёрных ореолов".
+static HBITMAP LoadIconDib(const std::wstring& path, int* wOut, int* hOut, COLORREF bg) {
+    *wOut = *hOut = 0;
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IWICImagingFactory* fac = nullptr;
+    HBITMAP out = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&fac))) && fac) {
+        IWICBitmapDecoder* dec = nullptr;
+        if (SUCCEEDED(fac->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                       WICDecodeMetadataCacheOnDemand, &dec)) && dec) {
+            IWICBitmapFrameDecode* frame = nullptr;
+            if (SUCCEEDED(dec->GetFrame(0, &frame)) && frame) {
+                UINT w = 0, h = 0;
+                frame->GetSize(&w, &h);
+                IWICFormatConverter* conv = nullptr;
+                if (w && h && SUCCEEDED(fac->CreateFormatConverter(&conv)) && conv) {
+                    if (SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+                                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                                   WICBitmapPaletteTypeCustom))) {
+                        std::vector<unsigned char> px((size_t)w * h * 4);
+                        if (SUCCEEDED(conv->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
+                            BITMAPINFO bi;
+                            memset(&bi, 0, sizeof(bi));
+                            bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+                            bi.bmiHeader.biWidth       = (LONG)w;
+                            bi.bmiHeader.biHeight      = -(LONG)h;   // top-down
+                            bi.bmiHeader.biPlanes      = 1;
+                            bi.bmiHeader.biBitCount    = 32;
+                            bi.bmiHeader.biCompression = BI_RGB;
+                            void* bits = nullptr;
+                            HDC dc = CreateCompatibleDC(nullptr);
+                            out = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+                            if (dc) DeleteDC(dc);
+                            if (out && bits) {
+                                unsigned char* d = (unsigned char*)bits;
+                                const unsigned char cb = GetBValue(bg);
+                                const unsigned char cg = GetGValue(bg);
+                                const unsigned char cr = GetRValue(bg);
+                                for (size_t i = 0, n = (size_t)w * h; i < n; ++i) {
+                                    const unsigned a   = px[i * 4 + 3];
+                                    const unsigned inv = 255u - a;
+                                    d[i * 4 + 0] = (unsigned char)((px[i * 4 + 0] * a + cb * inv) / 255u);
+                                    d[i * 4 + 1] = (unsigned char)((px[i * 4 + 1] * a + cg * inv) / 255u);
+                                    d[i * 4 + 2] = (unsigned char)((px[i * 4 + 2] * a + cr * inv) / 255u);
+                                    d[i * 4 + 3] = 255;
+                                }
+                                *wOut = (int)w;
+                                *hOut = (int)h;
+                            }
+                        }
+                    }
+                    conv->Release();
+                }
+                frame->Release();
+            }
+            dec->Release();
+        }
+        fac->Release();
+    }
+    if (hrCo == S_OK || hrCo == S_FALSE) CoUninitialize();
+    if (!out) printf("[GPU] сплаш: иконка не загрузилась (%ls)\n", path.c_str());
+    return out;
+}
+
+static void PaintSplash(HWND h) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT rc = { 0, 0, 0, 0 };
+    GetClientRect(h, &rc);
+    const COLORREF bg = RGB(13, 13, 16);
+    HBRUSH br = CreateSolidBrush(bg);
+    FillRect(dc, &rc, br);
+    DeleteObject(br);
+
+    if (g_splashBmp) {
+        const int cw = rc.right - rc.left;
+        const int ch = rc.bottom - rc.top;
+        int side = (cw < ch ? cw : ch) * 52 / 100;
+        if (side < 64) side = 64;
+        const int x = rc.left + (cw - side) / 2;
+        const int y = rc.top + ch * 42 / 100 - side / 2;
+        HDC mem = CreateCompatibleDC(dc);
+        HGDIOBJ old = SelectObject(mem, g_splashBmp);
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchBlt(dc, x, y, side, side, mem, 0, 0, g_splashW, g_splashH, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    }
+
+    const int fs = MulDiv(20, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    HFONT f = CreateFontW(-fs, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH, L"Segoe UI");
+    HGDIOBJ of = SelectObject(dc, f);
+    SetTextColor(dc, RGB(198, 198, 206));
+    SetBkMode(dc, TRANSPARENT);
+    RECT tr = rc;
+    tr.top    = rc.bottom - (rc.bottom - rc.top) * 16 / 100;
+    tr.bottom = rc.bottom - (rc.bottom - rc.top) * 5 / 100;
+    DrawTextW(dc, g_splashSub.c_str(), -1, &tr,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SelectObject(dc, of);
+    DeleteObject(f);
+    EndPaint(h, &ps);
+}
+
 // --- Окно -------------------------------------------------------------------
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_PAINT:
+        if (g_splash) { PaintSplash(h); return 0; }
+        break;
+    case WM_ERASEBKGND:
+        if (g_splash) return 1;   // сплаш сам заливает фон в WM_PAINT
+        break;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { g_winClosed = true; DestroyWindow(h); return 0; }
+        break;
     case WM_CLOSE:
         g_winClosed = true;
         DestroyWindow(h);
@@ -200,7 +330,7 @@ static void EnsureWindow() {
     RECT r = { 0, 0, 1280, 720 };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExW(0, wc.lpszClassName,
-                             L"ZerpexPS5 — вывод гостя (фаза 5.0)",
+                             L"ZerpexPS5 v" ZERPEX_CORE_VERSION_W L" — вывод гостя",
                              WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              r.right - r.left, r.bottom - r.top,
@@ -1017,7 +1147,7 @@ static bool InitPm4Pipeline() {
 
     EnsurePm4Fb();
     g_pmReady = true;
-    printf("[GPU] шаг: PM4-пайплайн ок (шейдеров гостя нет — прокси, это фаза 5.3)\n");
+    printf("[GPU] шаг: PM4-пайплайн ок (прокси; шейдеры — транслятор 5.3 RDNA2->SPIR-V)\n");
     fflush(stdout);
     return true;
 }
@@ -1136,6 +1266,7 @@ bool Prepare(uint32_t w, uint32_t h, uint64_t frameBytes) {
 
     EnsureWindow();
     if (!g_hwnd) return false;
+    if (g_splash) g_splash = false;   // содержимое окна сменяется на вывод игры
 
     if (!g_initTried) {
         g_initTried = true;
@@ -1332,6 +1463,8 @@ void Shutdown() {
     if (g_inst) { pDestroyInstance(g_inst, nullptr); g_inst = VK_NULL_HANDLE; }
     g_phys = VK_NULL_HANDLE;
     if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = nullptr; }
+    if (g_splashBmp) { DeleteObject(g_splashBmp); g_splashBmp = nullptr; }
+    g_splash = false;
     UnregisterClassW(L"ZerpexGuestWnd", GetModuleHandleW(nullptr));
     if (g_dll) { FreeLibrary(g_dll); g_dll = nullptr; }
     printf("[GPU] Vulkan-слой выгружен\n");
@@ -1339,6 +1472,36 @@ void Shutdown() {
 }
 
 bool DeviceAlive() { return g_dev != VK_NULL_HANDLE; }
+
+// --- Сплаш: публичный API ----------------------------------------------------
+bool SplashOpen(const std::wstring& iconPath, const std::wstring& subtitle) {
+    EnsureWindow();
+    if (!g_hwnd || g_winClosed) return false;
+    g_splashSub = subtitle;
+    if (g_splashBmp) { DeleteObject(g_splashBmp); g_splashBmp = nullptr; }
+    if (!iconPath.empty()) g_splashBmp = LoadIconDib(iconPath, &g_splashW, &g_splashH,
+                                                     RGB(13, 13, 16));
+    g_splash = true;
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+    UpdateWindow(g_hwnd);
+    PumpMessages();
+    printf("[GPU] сплаш: иконка %ls, подпись \"%ls\"\n",
+           iconPath.empty() ? L"(нет)" : iconPath.c_str(), subtitle.c_str());
+    fflush(stdout);
+    return true;
+}
+
+void SplashPump() { PumpMessages(); }
+
+bool SplashActive() { return g_splash && g_hwnd && !g_winClosed; }
+
+void SplashEnd() {
+    if (!g_splash) return;
+    g_splash = false;
+    if (g_hwnd) { InvalidateRect(g_hwnd, nullptr, TRUE); UpdateWindow(g_hwnd); }
+}
+
+bool WindowOpen() { return g_hwnd != nullptr && !g_winClosed; }
 
 void SetPreferredDevice(int index) { g_prefDevice = index; }
 
@@ -1564,6 +1727,11 @@ void Shutdown() {}
 bool DeviceAlive() { return false; }
 void SetPreferredDevice(int) {}
 int Probe(int) { SayOnce(); return -1; }
+bool SplashOpen(const std::wstring&, const std::wstring&) { return false; }
+void SplashPump() {}
+bool SplashActive() { return false; }
+void SplashEnd() {}
+bool WindowOpen() { return false; }
 
 #endif
 

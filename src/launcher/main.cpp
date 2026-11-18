@@ -1,9 +1,12 @@
 // ============================================================================
-// ZerpexPS5 — Launcher v0.4 (библиотека игр в стиле PS5)
+// ZerpexPS5 — Launcher v0.5 (библиотека игр в стиле PS5)
 //
 // Что есть:    окно, DX11-рендер, ImGui, PS5-тема, библиотека игр (скан
 //              папок, param.json, обложки через WIC), выбор игры ставит её
 //              обложку на фон, games.json рядом с EXE.
+// Новое v0.5:  версии ядра и лаунчера — в src/version.h (ядро 0.8.0:
+//              GPU-демо, сплаш "иконка игры + RUNNED WITH ZerpexPS5",
+//              транслятор RDNA2->SPIR-V).
 // Новое v0.4:  клик по аватарке выезжает панель настроек (settings.json):
 //              выбор видеокарты для эмуляции (честное перечисление через
 //              vulkan-1.dll, без линковки), доп. параметры запуска ядра,
@@ -42,6 +45,7 @@
 #include "../core/log.h"
 #include "../core/game.h"
 #include "../core/texture.h"
+#include "../version.h"
 
 // Хедеры Vulkan нужны только для перечисления видеокарт в настройках;
 // грузим DLL динамически, линковки нет. Если SDK нет при сборке —
@@ -326,7 +330,7 @@ static void EnumerateGpus() {
     if (!pCi) { g_gpus.push_back("(vulkan-1.dll без vkCreateInstance)"); FreeLibrary(dll); return; }
 
     VkApplicationInfo app { VK_STRUCTURE_TYPE_APPLICATION_INFO };
-    app.pApplicationName = "ZerpexPS5 Launcher";
+    app.pApplicationName = "ZerpexPS5 Launcher v" ZERPEX_LAUNCHER_VERSION;
     app.apiVersion = VK_API_VERSION_1_0;
     VkInstanceCreateInfo ci { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ci.pApplicationInfo = &app;
@@ -675,7 +679,7 @@ static void DrawHeader(const ImVec2& disp) {
     } else {
         dl->AddRectFilled(ImVec2(30, 34), ImVec2(38, 72), ACCENT, 4.0f);
         dl->AddText(g_font_title, 34.0f, ImVec2(54, 32), COL_WHITE, "ZerpexPS5");
-        dl->AddText(g_font, 15.0f, ImVec2(56, 72), COL_DIM, "LAUNCHER v0.4 — БИБЛИОТЕКА");
+        dl->AddText(g_font, 15.0f, ImVec2(56, 72), COL_DIM, "LAUNCHER v" ZERPEX_LAUNCHER_VERSION " — БИБЛИОТЕКА");
     }
 
     // «Чип» пользователя справа (как в PS5)
@@ -1096,7 +1100,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE, LPSTR, int) {
     const int pos_x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
     const int pos_y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"ZerpexPS5 — Launcher",
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"ZerpexPS5 v" ZERPEX_LAUNCHER_VERSION_W L" — Launcher",
                              WS_OVERLAPPEDWINDOW, pos_x, pos_y, win_w, win_h,
                              nullptr, nullptr, hinst, nullptr);
     if (!g_hwnd || !InitD3D(g_hwnd)) {
@@ -1121,7 +1125,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE, LPSTR, int) {
     ImGui_ImplDX11_Init(g_dev, g_ctx);
     g_imgui_ready = true;
 
-    zrx::Log::info("ZerpexPS5 Launcher v0.4 запущен");
+    zrx::Log::info("ZerpexPS5 Launcher v" ZERPEX_LAUNCHER_VERSION " запущен");
     zrx::Log::info("Рендер: DirectX 11 + Dear ImGui 1.93");
 
     // Загружаем сохранённую библиотеку

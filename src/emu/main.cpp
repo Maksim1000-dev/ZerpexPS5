@@ -1,17 +1,20 @@
 // ============================================================================
-// ZerpexPS5 — ядро эмулятора · фаза 5.0 (+ фаза 4, фаза 2.5)
+// ZerpexPS5 — ядро эмулятора · v0.8.0
+// (фазы: 2.5 анализ · 4 исполнение · 5.2 PM4-рендер · 5.3 транслятор RDNA2 ·
+//        7.1–7.7.2 запуск ELF: VEH-bail без longjmp, куча, TLS, kernel-args)
 //
 // ЧТО ЕСТЬ:  парсер ELF64 + SELF PS5, память на VirtualAlloc, HLE-диспетчер,
 //            НАТИВНОЕ ИСПОЛНЕНИЕ гостевого x86-64 с перехватом syscall'ов
 //            (патч syscall->UD2 + VEH), релокации PT_DYNAMIC с импорт-заглушками,
-//            ПОТОКИ гостя, ФАЙЛЫ (/app0 -> папка игры), ПЕРВЫЙ ПИКСЕЛЬ
-//            (sceVideoOut* -> окно Win32 + Vulkan-свапчейн, без шейдеров),
-//            умный анализ SELF, корпус-режим.
-// ЧЕГО НЕТ:  PM4/шейдеров/растеризации GPU (фаза 5.1+),
+//            ПОТОКИ гостя, ФАЙЛЫ (/app0 -> папка игры), ПЕРВЫЙ ПИКСЕЛЬ и
+//            PM4-кадр (прокси-треугольник), транслятор RDNA2->SPIR-V (5.3),
+//            сплаш "иконка игры + RUNNED WITH ZerpexPS5" до первого кадра.
+// ЧЕГО НЕТ:  полного GNM-пайплайна (импорты добираются итерациями),
 //            дешифровки retail SELF (фаза 7, только там нужны ключи).
 //
 // Использование:
 //   ZerpexPS5.exe <файл eboot.bin/eboot.elf | папка игры>   — анализ или запуск
+//   ZerpexPS5.exe --gpu-demo [путь к игре]                  — окно+сплаш+треугольник
 //   ZerpexPS5.exe --corpus <папка с дампами>                — корпус-сравнение
 //
 // Правила хозяина: ничего не скачивать; собранный EXE не запускать самому.
@@ -31,6 +34,7 @@
 #include "../core/mem.h"
 #include "../core/hle.h"
 #include "../core/dyn.h"
+#include "../version.h"
 #include "exec.h"
 #include "gpu.h"
 #include "gpu_vk.h"   // приоритет видеокарты (--gpu N из лаунчера)
@@ -193,6 +197,51 @@ static void PrintPhdrs(const zrx::ElfImage& e, uint64_t baseOffset) {
 }
 
 // ----------------------------------------------------------------------------
+// Иконка игры для сплаша: <игра>\sce_sys\icon0.png (как у PS5-дампов).
+// path пуст -> автопоиск в decomp (локальные дампы рядом с ядром, gitignore).
+// ----------------------------------------------------------------------------
+static std::wstring FindGameIcon(const std::wstring& path) {
+    std::error_code ec;
+    auto isFile = [](const std::wstring& p) {
+        std::error_code e2;
+        return !p.empty() && fs::is_regular_file(fs::path(p), e2);
+    };
+    if (!path.empty()) {
+        fs::path d = fs::is_directory(fs::path(path), ec) ? fs::path(path)
+                                                          : fs::path(path).parent_path();
+        for (int up = 0; up < 3 && !d.empty(); ++up) {
+            const std::wstring c1 = (d / L"sce_sys" / L"icon0.png").wstring();
+            if (isFile(c1)) return c1;
+            const std::wstring c2 = (d / L"icon0.png").wstring();
+            if (isFile(c2)) return c2;
+            const fs::path parent = d.parent_path();
+            if (parent.empty() || parent == d) break;
+            d = parent;
+        }
+        return L"";
+    }
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const fs::path base = fs::path(exe).parent_path();
+    const fs::path roots[] = { base, base.parent_path(), fs::current_path(ec) };
+    for (const fs::path& root : roots) {
+        if (root.empty()) continue;
+        const fs::path decomp = root / L"decomp";
+        if (!fs::is_directory(decomp, ec)) continue;
+        std::error_code e3;
+        fs::recursive_directory_iterator it(decomp, fs::directory_options::skip_permission_denied, e3), end;
+        for (; it != end; it.increment(e3)) {
+            if (e3) { e3.clear(); continue; }
+            std::error_code e4;
+            if (it->is_regular_file(e4) && it->path().filename() == L"icon0.png" &&
+                it->path().parent_path().filename() == L"sce_sys")
+                return it->path().wstring();
+        }
+    }
+    return L"";
+}
+
+// ----------------------------------------------------------------------------
 // Путь ELF: разбор + маппинг + релокации + НАТИВНЫЙ ЗАПУСК (фаза 4)
 // ----------------------------------------------------------------------------
 static void RunElfProgram(const std::vector<uint8_t>& data) {
@@ -290,11 +339,20 @@ static void RunElfProgram(const std::vector<uint8_t>& data) {
     zrx::hle::SetGameRoot(g_ebootDir);
     zrx::gpu::AttachMemory(&mem);
     printf("\n[ФС] /app0 -> %s\n", Utf8(g_ebootDir).c_str());
-    printf("[GPU] фаза 5.0: sceVideoOut*/sceGnm* через импорт-заглушки -> Vulkan\n");
+    printf("[GPU] фазы 5.0–5.3: sceVideoOut*/sceGnm* через импорт-заглушки -> Vulkan\n");
     printf("\n");
     zrx::hle::PrintSummary();
     printf("\n  [фаза 4] перехват: syscall (0F 05) -> UD2 (0F 0B) + VEH, потоки, файлы.\n");
     printf("  Конвенция: rax=номер, аргументы rdi,rsi,rdx,r10,r8,r9 (+хвост на стеке).\n\n");
+
+    // --- Сплаш "как у Unity": иконка игры + RUNNED WITH ZerpexPS5 --------------
+    // Окно ОДНО: до GPU-init гостя показывается сплаш, Prepare() сам сменит
+    // содержимое на вывод игры (без второго окна и мигания).
+    {
+        const std::wstring icon = FindGameIcon(g_ebootDir);
+        if (!zrx::gpu_vk::SplashOpen(icon, L"RUNNED WITH ZerpexPS5 v" ZERPEX_CORE_VERSION_W))
+            printf("[GPU] сплаш: окно не открылось (гость продолжит без него)\n");
+    }
 
     zrx::exec::RunResult rr = zrx::exec::Run(mem, e.entry, e);
     Line();
@@ -576,16 +634,68 @@ static void StartLogTee() {
         setvbuf(g_logFile, nullptr, _IONBF, 0);   // без буфера: хвост лога не теряется
         SYSTEMTIME st;
         GetLocalTime(&st);
-        fprintf(g_logFile, "ZerpexPS5 log | %04u-%02u-%02u %02u:%02u:%02u\r\n",
+        fprintf(g_logFile, "ZerpexPS5 v" ZERPEX_CORE_VERSION " log | %04u-%02u-%02u %02u:%02u:%02u\r\n",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         fflush(g_logFile);
     }
     CreateThread(nullptr, 0, &LogTeeProc, nullptr, 0, nullptr);
 }
 
+// ----------------------------------------------------------------------------
+// --gpu-demo [путь к игре]: витрина слоя 5 без гостя.
+// Сплаш (иконка игры + RUNNED WITH ZerpexPS5) -> Prepare -> PM4-треугольник,
+// шейдеры которого собраны ТРАНСЛЯТОРОМ RDNA2->SPIR-V (5.3).
+// ----------------------------------------------------------------------------
+static int RunGpuDemo(const std::wstring& gamePath) {
+    const std::wstring icon = FindGameIcon(gamePath);
+    printf("[DEMO] сплаш: иконка %s\n", icon.empty() ? "(не найдена)" : Utf8(icon).c_str());
+    fflush(stdout);
+    if (!zrx::gpu_vk::SplashOpen(icon, L"RUNNED WITH ZerpexPS5 v" ZERPEX_CORE_VERSION_W)) {
+        printf("[DEMO] окно не открылось — демо невозможно\n");
+        return 1;
+    }
+
+    const ULONGLONG t0 = GetTickCount64();
+    while (GetTickCount64() - t0 < 2400) {
+        if (!zrx::gpu_vk::SplashActive()) {
+            printf("[DEMO] окно закрыто пользователем до старта Vulkan\n");
+            zrx::gpu_vk::Shutdown();
+            return 0;
+        }
+        zrx::gpu_vk::SplashPump();
+        Sleep(16);
+    }
+
+    const uint32_t W = 1280, H = 720;
+    if (!zrx::gpu_vk::Prepare(W, H, (uint64_t)W * H * 4)) {
+        printf("[DEMO] Vulkan не поднялся (причина выше) — закрываю окно\n");
+        zrx::gpu_vk::Shutdown();
+        return 1;
+    }
+    if (!zrx::gpu_vk::RenderPm4(3))
+        printf("[DEMO] PM4-кадр не отрисован (причина выше)\n");
+
+    int fails = 0;
+    while (zrx::gpu_vk::WindowOpen()) {
+        if (!zrx::gpu_vk::PresentPm4(W, H)) {
+            if (++fails > 180) {   // ~3 с подряд отказов — дальше смысла нет
+                printf("[DEMO] показ 3 с подряд отказывает — выхожу\n");
+                break;
+            }
+        } else {
+            fails = 0;
+        }
+        Sleep(16);
+    }
+    zrx::gpu_vk::Shutdown();
+    printf("[DEMO] окно закрыто — демо завершено честно\n");
+    return 0;
+}
+
 static int RealMain() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    SetConsoleTitleW(L"ZerpexPS5 v" ZERPEX_CORE_VERSION_W L" — ядро");
     zrx::exec::OpenCrashLog();   // 7.7: append-хэндл лога ДО тира — без sharing-рисков
     StartLogTee();
     printf("[ЛОГ] вывод дублируется в файл: zerpex_log.txt (рядом с EXE)\n");
@@ -595,15 +705,23 @@ static int RealMain() {
     if (!argvW) { printf("Ошибка: не получить аргументы\n"); return 1; }
 
     // Аргументы: первый позиционный — путь; --corpus <dir>; --gpu <N> (лаунчер);
+    // --gpu-demo [путь] (витрина слоя 5 без гостя);
     // --vkprobe [N] (диагностика Vulkan, N=1..5; без N — прогон всех);
     // хвост передаётся как есть, ядро честно пишет, что не знает параметр.
-    std::wstring arg1, corpusDir;
+    std::wstring arg1, corpusDir, demoPath;
+    bool demoMode = false;
     int gpuPref  = -1;
     int probeExp = -1;
     for (int i = 1; i < argcW; ++i) {
         const std::wstring a = argvW[i];
         if (a == L"--corpus" && i + 1 < argcW) { corpusDir = argvW[++i]; continue; }
         if (a == L"--gpu"    && i + 1 < argcW) { gpuPref = _wtoi(argvW[++i]); continue; }
+        if (a == L"--gpu-demo") {
+            demoMode = true;
+            if (i + 1 < argcW && argvW[i + 1][0] != L'-')
+                demoPath = argvW[++i];
+            continue;
+        }
         if (a == L"--vkprobe") {
             // с числом — один эксперимент (ребёнок); без — прогон 1..5 (родитель)
             if (i + 1 < argcW && argvW[i + 1][0] != L'-')
@@ -618,7 +736,8 @@ static int RealMain() {
     LocalFree(argvW);
 
     printf("================================================================\n");
-    printf("  ZerpexPS5 — ядро | ФАЗА 5.0: первый пиксель + ФАЗА 4 + ФАЗА 2.5\n");
+    printf("  ZerpexPS5 v%s — ядро | фазы: 2.5 · 4 · 5.2 · 5.3 · 7.1–7.7.2\n",
+           ZERPEX_CORE_VERSION);
     printf("================================================================\n");
 
     if (gpuPref >= 0) {
@@ -667,6 +786,12 @@ static int RealMain() {
         return r;
     }
 
+    // --- витрина слоя 5: окно + сплаш + PM4-треугольник (без гостя) ---
+    if (demoMode) {
+        if (demoPath.empty()) demoPath = arg1;   // допускаем и "<игра> --gpu-demo"
+        return RunGpuDemo(demoPath);
+    }
+
     // --- корпус-режим ---
     if (!corpusDir.empty()) {
         zrx::analyze::CorpusAnalyze(corpusDir);
@@ -676,6 +801,7 @@ static int RealMain() {
     if (arg1.empty()) {
         printf("Использование: ZerpexPS5.exe <eboot.bin | eboot.elf | папка игры>\n");
         printf("               [--gpu <N> — приоритет видеокарты, из лаунчера]\n");
+        printf("               ZerpexPS5.exe --gpu-demo [путь к игре] — окно+сплаш+треугольник\n");
         printf("               ZerpexPS5.exe --corpus <папка с дампами>\n");
         return 1;
     }
@@ -739,9 +865,11 @@ static int RealMain() {
     }
 
     Line();
-    printf("ZerpexPS5: фаза 5.2 (рендер из PM4: прокси-треугольник) + фаза 4 (исполнение) + фаза 2.5.\n");
+    printf("ZerpexPS5 v%s: фазы 2.5 (анализ) · 4 (исполнение) · 5.2 (рендер из PM4) · "
+           "5.3 (RDNA2->SPIR-V) · 7.1–7.7.2 (запуск ELF).\n", ZERPEX_CORE_VERSION);
+    printf("Сплаш: иконка игры + RUNNED WITH ZerpexPS5; окно сменяется на вывод игры при GPU-init.\n");
     printf("SELF: попытка запуска открытого вложенного ELF (фаза 7, шаг 1; retail — после дешифровки).\n");
-    printf("Дальше: фаза 5.3 (настоящая трансляция GCN-шейдеров).\n");
+    printf("Дальше: GPU-init гостя (первый настоящий кадр) — недостающие импорты добираются итерациями.\n");
     return 0;
 }
 
