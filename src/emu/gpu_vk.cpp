@@ -823,11 +823,11 @@ static const uint32_t kVsSpirv[] = {
     0x07230203, // магия SPIR-V
     0x00010000, // версия 1.0
     0,          // генератор
-    15,         // bound (id 1..13)
+    15,         // bound (id 1..14)
     0,          // схема
     0x00010011, 1,                    // OpCapability Shader
     0x0003000E, 0, 1,                 // OpMemoryModel Logical GLSL450
-    0x0009000F, 0, 11, 0x6E69616D, 0, // OpEntryPoint Vertex "main", интерфейс
+    0x0009000F, 0, 14, 0x6E69616D, 0, // OpEntryPoint Vertex "main" (id функции %14)
     5, 6, 7, 8,                       //   (vars: pos, col, outColor, Position)
     0x00040047, 5, 30, 0,             // OpDecorate 5 Location 0 (позиция)
     0x00040047, 6, 30, 1,             // OpDecorate 6 Location 1 (цвет)
@@ -843,7 +843,7 @@ static const uint32_t kVsSpirv[] = {
     0x0004003B, 3, 6, 1,              // OpVariable %6 (Input,  Location 1)
     0x0004003B, 4, 7, 3,              // OpVariable %7 (Output, Location 0)
     0x0004003B, 4, 8, 3,              // OpVariable %8 (Output, BuiltIn Pos)
-    0x00050036, 9, 0, 10,             // OpFunction void %9 (тип %10)
+    0x00050036, 9, 14, 0, 10,         // OpFunction void %14 (control=0, тип %10)
     0x000200F8, 11,                   // OpLabel %11
     0x0004003D, 2, 12, 5,             // OpLoad %12 = %5 (позиция)
     0x0004003D, 2, 13, 6,             // OpLoad %13 = %6 (цвет)
@@ -861,9 +861,9 @@ static const uint32_t kFsSpirv[] = {
     0,
     0x00010011, 1,                    // OpCapability Shader
     0x0003000E, 0, 1,                 // OpMemoryModel Logical GLSL450
-    0x0007000F, 4, 9, 0x6E69616D, 0,  // OpEntryPoint Fragment "main", интерфейс
+    0x0007000F, 4, 10, 0x6E69616D, 0, // OpEntryPoint Fragment "main" (id функции %10)
     5, 6,                             //   (vars: inColor, outColor)
-    0x00030010, 9, 7,                 // OpExecutionMode OriginUpperLeft
+    0x00030010, 10, 7,                // OpExecutionMode OriginUpperLeft
     0x00040047, 5, 30, 0,             // OpDecorate 5 Location 0 (вход)
     0x00040047, 6, 30, 0,             // OpDecorate 6 Location 0 (выход)
     0x00030016, 1, 32,                // OpTypeFloat f32
@@ -874,7 +874,7 @@ static const uint32_t kFsSpirv[] = {
     0x00040021, 8, 7,                 // OpTypeFunction void->void
     0x0004003B, 3, 5, 1,              // OpVariable %5 (Input,  Location 0)
     0x0004003B, 4, 6, 3,              // OpVariable %6 (Output, Location 0)
-    0x00050036, 7, 0, 8,              // OpFunction void %9
+    0x00050036, 7, 10, 0, 8,          // OpFunction void %10 (control=0, тип %8)
     0x000200F8, 9,                    // OpLabel %10
     0x0004003D, 2, 11, 5,             // OpLoad %11 = %5
     0x0003003E, 6, 11,                // OpStore outColor <- %11
@@ -894,6 +894,7 @@ static const float kProxyTri[24] = {
 // Транслируется rdna2::Translate в SPIR-V; результат рисует ТОТ ЖЕ треугольник,
 // что и kVsSpirv/kFsSpirv, но собранный из guest-подобного машинного кода.
 // VS: SGPR0 = индекс вершины; компоненты и экспорт сверены с Table 62-83.
+// EXP (Table 106): word0 = EN/TARGET/COMPR/DONE/VM, word1 = VSRC0..3.
 static const uint32_t kVsRdna2[] = {
     0x7E000200,             // V_MOV_B32     v0 = s0            (индекс вершины)
     0x36020081,             // V_AND_B32     v1 = 1 & v0        (v0 & 1)
@@ -905,7 +906,7 @@ static const uint32_t kVsRdna2[] = {
     0xD54B0007, 0x03CE0AF6, // VOP3A V_FMA_F32 v7 = 4.0 * v5 + (-1.0)
     0x7E100280,             // V_MOV_B32     v8 = 0             (SRC0=128 -> int 0)
     0x7E1202F2,             // V_MOV_B32     v9 = 1.0           (SRC0=242 -> 1.0f)
-    0x09080706, 0x0000F08C, // EXP: gl_Position = (v6,v7,v8,v9), TARGET 12, EN=0xF, DONE
+    0xF80008CF, 0x09080706, // EXP: gl_Position = (v6,v7,v8,v9), TARGET 12, EN=0xF, DONE
     0xBF810000,             // S_ENDPGM
 };
 static const uint32_t kFsRdna2[] = {
@@ -913,7 +914,7 @@ static const uint32_t kFsRdna2[] = {
     0x7E020280,             // V_MOV_B32     v1 = 0             (зелёный)
     0x7E040280,             // V_MOV_B32     v2 = 0             (синий)
     0x7E0602F2,             // V_MOV_B32     v3 = 1.0           (альфа)
-    0x03020100, 0x0000F000, // EXP: MRT0 = (v0,v1,v2,v3), TARGET 0, EN=0xF
+    0xF800080F, 0x03020100, // EXP: MRT0 = (v0,v1,v2,v3), TARGET 0, EN=0xF, DONE
     0xBF810000,             // S_ENDPGM
 };
 
@@ -1048,7 +1049,7 @@ static bool InitPm4Pipeline() {
     VkVertexInputAttributeDescription attrs[2] {};
     attrs[0].location = 0; attrs[0].binding = 0;
     attrs[0].format   = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[0].offset = 0;
-    attrs[1].location = 1; attrs[1].binding = 1;
+    attrs[1].location = 1; attrs[1].binding = 0;   // оба атрибута в binding 0 (stride 32)
     attrs[1].format   = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[1].offset = 16;
 
     VkPipelineVertexInputStateCreateInfo vi {
@@ -1116,9 +1117,9 @@ static bool InitPm4Pipeline() {
     pci.layout              = g_pmLayout;
     pci.renderPass          = g_pmPass;
     pci.subpass             = 0;
-    if (pCreatePipelines(g_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pmPipe)
-            != VK_SUCCESS) {
-        printf("[GPU]   vkCreateGraphicsPipelines не удался\n");
+    const VkResult pr = pCreatePipelines(g_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &g_pmPipe);
+    if (pr != VK_SUCCESS) {
+        printf("[GPU]   vkCreateGraphicsPipelines не удался: VkResult %d\n", (int)pr);
         fflush(stdout);
         g_pmFailed = true; return false;
     }

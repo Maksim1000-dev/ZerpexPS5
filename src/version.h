@@ -5,7 +5,7 @@
 // ============================================================================
 #pragma once
 
-#define ZERPEX_CORE_VERSION      "0.8.0"
-#define ZERPEX_CORE_VERSION_W    L"0.8.0"
+#define ZERPEX_CORE_VERSION      "0.8.1"
+#define ZERPEX_CORE_VERSION_W    L"0.8.1"
 #define ZERPEX_LAUNCHER_VERSION  "0.5"
 #define ZERPEX_LAUNCHER_VERSION_W L"0.5"

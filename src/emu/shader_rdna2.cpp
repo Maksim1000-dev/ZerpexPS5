@@ -68,6 +68,7 @@ enum : uint32_t {
     R2_TOP_SOPP     = 0x17F,
     R2_VOP3A_TOP6   = 0x35,   // word0[31:26] = 0b110101
     R2_VOP3P_TOP6   = 0x33,   // word0[31:26] = 0b110011
+    R2_EXP_TOP6     = 0x3E,   // Table 106: word0[31:26] = 0b111110
     R2_SOPK_S_MOVK_I32 = 0,
     R2_SOP1_S_MOV_B32  = 3,
     R2_SOPP_S_NOP      = 0,
@@ -461,10 +462,10 @@ static bool Decode(Ctx& c) {
         // ---------------- SOP2 (0x100..0x15F) ----------------
         if (top9 >= R2_TOP_SOP2_MIN && top9 <= R2_TOP_SOP2_MAX)
             return c.Fail("SOP2 unsupported", w & 0x7F);
-        // ---------------- прочие скалярные (SMEM и т.п., 0x180+) ----------------
-        if (w & 0x80000000u) return c.Fail("unknown scalar encoding", top9);
 
         // ---------------- 64-битные векторные (по word0[31:26]) ----------------
+        // ВАЖНО: проверяем ДО скалярной ловушки ниже — у VOP3A/EXP бит31=1,
+        // иначе V_FMA 0xD54B0006 уходил в "unknown scalar" (top9 0x1AA).
         uint32_t top6 = w >> 26;
         if (top6 == R2_VOP3P_TOP6) return c.Fail("VOP3P unsupported", w);
         if (top6 == R2_VOP3A_TOP6) {
@@ -493,21 +494,23 @@ static bool Decode(Ctx& c) {
             }
             return c.Fail("VOP3A op unsupported", op);
         }
-        if (top6 >= 0x30 && top6 <= 0x3F) {              // DS/память/EXP и пр.
-            // EXP: 64-бит; сигнатура — второе слово [31:16] == 0.
-            if (c.ip < c.nWords && (c.w32[c.ip] >> 16) == 0) {
-                uint32_t w0 = w, w1 = c.w32[c.ip++];
-                uint32_t target = w1 & 0x3F;
-                uint32_t en     = (w1 >> 12) & 0xF;
-                uint32_t compr  = (w1 >> 6) & 1;
-                uint32_t done   = (w1 >> 7) & 1;   // не влияет на трансляцию
-                uint32_t vm     = (w1 >> 8) & 1;
-                (void)done;
-                if (compr || vm) return c.Fail("EXP COMPR/VM not supported", w1);
-                if (en != 0xF) return c.Fail("EXP partial EN", en);
-                uint32_t srcs[4] = { w0 & 0xFF, (w0 >> 8) & 0xFF,
-                                     (w0 >> 16) & 0xFF, (w0 >> 24) & 0xFF };
-                if (target == R2_EXP_TARGET_NULL) { c.decoded++; continue; }  // Null — скип
+        // ---------------- EXP (Table 106): ENCODING [31:26] = 0x3E ----------------
+        // word0 = управление (EN/TARGET/COMPR/DONE/VM), word1 = VSRC0..3.
+        // (в прокси-шейдере слова стояли наоборот — EXP ошибочно шёл в VOP2)
+        if (top6 == R2_EXP_TOP6) {
+            if (c.ip >= c.nWords) return c.Fail("truncated (EXP)", 0);
+            const uint32_t w1 = c.w32[c.ip++];
+            const uint32_t en     = w & 0xF;
+            const uint32_t target = (w >> 4) & 0x3F;
+            const uint32_t compr  = (w >> 10) & 1;
+            const uint32_t done   = (w >> 11) & 1;   // не влияет на трансляцию
+            const uint32_t vm     = (w >> 12) & 1;
+            (void)done;
+            const uint32_t srcs[4] = { w1 & 0xFF, (w1 >> 8) & 0xFF,
+                                       (w1 >> 16) & 0xFF, (w1 >> 24) & 0xFF };
+            if (target == R2_EXP_TARGET_NULL) { c.decoded++; continue; }  // Null — скип
+            if (compr || vm) return c.Fail("EXP COMPR/VM not supported", w);
+            if (en != 0xF) return c.Fail("EXP partial EN", en);
                 if (c.b.isVertex && target == R2_EXP_TARGET_POSITION) {
                     uint32_t cs[4];
                     for (int i = 0; i < 4; i++) {
@@ -533,9 +536,9 @@ static bool Decode(Ctx& c) {
                     c.decoded++; continue;
                 }
                 return c.Fail("EXP target unsupported", target);
-            }
-            return c.Fail("vector 64-bit format unsupported", top6);
         }
+        // ---------------- прочие скалярные/64-битные (SMEM и т.п.) ----------------
+        if (w & 0x80000000u) return c.Fail("unknown 64-bit/scalar encoding", top9);
 
         // ---------------- 32-битные векторные (bit31 == 0) ----------------
         uint32_t fam = (w >> 25) & 0x7F;
