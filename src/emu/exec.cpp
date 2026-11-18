@@ -335,10 +335,27 @@ static uint64_t HeapCalloc(uint64_t n) {
     return q;
 }
 
+// [7.7.2] Адрес памяти гостя в хосте: сначала сегменты гостя (образ/куча/
+// заглушки), иначе — прямой хостовый диапазон (стек гостя = стек хоста: гость
+// исполняется нативно), если VirtualQuery подтверждает доступ на весь диапазон.
+static uint8_t* HostPtr(uint64_t addr, uint64_t n, bool wr) {
+    if (!addr || addr + n < addr || !n) return nullptr;
+    if (uint8_t* p = g_mem ? g_mem->Ptr(addr) : nullptr) return p;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((LPCVOID)(uintptr_t)addr, &mbi, sizeof(mbi))) return nullptr;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || mbi.Protect == PAGE_NOACCESS)
+        return nullptr;
+    if (mbi.RegionSize < n) return nullptr;   // диапазон должен лежать в одном регионе
+    const DWORD w = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const DWORD r = w | PAGE_READONLY | PAGE_EXECUTE_READ;
+    if (!(mbi.Protect & (wr ? w : r))) return nullptr;
+    return (uint8_t*)(uintptr_t)addr;
+}
+
 static uint64_t HeapMemmove(PCONTEXT c, uint64_t dst, uint64_t src, uint64_t n) {
     if (!g_mem || !n) return dst;
-    void* d = (void*)(uintptr_t)g_mem->Ptr(dst);
-    void* s = (void*)(uintptr_t)g_mem->Ptr(src);
+    void* d = HostPtr(dst, n, true);
+    void* s = HostPtr(src, n, false);
     if (!d || !s) {
         char buf[192];
         snprintf(buf, sizeof(buf),
@@ -352,6 +369,30 @@ static uint64_t HeapMemmove(PCONTEXT c, uint64_t dst, uint64_t src, uint64_t n) 
         return 0;
     }
     memmove(d, s, (size_t)n);
+    return dst;
+}
+
+// [7.7.2] PLT[192] 8zTFvBIAIN8 = memset(dst, val, n). Опознан по поведению
+// (tools/scan3.c): единственный вызов внутри хелпера alloc+zero — 
+//   movsxd rdx,r14d(len); mov rdi,rbx(alloc); xor esi,esi; call memset
+// и сайты вида (ptr, 0, 0x1200). Вставки хеш-таблиц (SwissTable) полагаются на
+// него: контрольные байты 0xFF. Без реализации таблицы оставались "пустыми по
+// нулям" и поиск уходил в мусор (краш 7.7: mov rbx,[rax=0x200] @0x1A2C9D3).
+static uint64_t HeapMemset(PCONTEXT c, uint64_t dst, uint64_t val, uint64_t n) {
+    if (!g_mem || !n) return dst;
+    void* d = HostPtr(dst, n, true);
+    if (!d) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "memset: недоступная память dst=0x%llX len=%llu",
+                 (unsigned long long)dst, (unsigned long long)n);
+        CrashReport(buf);
+        if (t_bailPtr) {
+            BailPatchContext(c, JMPL_FAULT);
+            return 0;
+        }
+        return 0;
+    }
+    memset(d, (int)(val & 0xFF), (size_t)n);
     return dst;
 }
 
@@ -372,6 +413,12 @@ static const char* kImpCalloc  = "2X5agFjKxMc#W#W";
 static const char* kImpFree    = "tIhsqj0qsFE#W#W";
 static const char* kImpAligned = "gQX+4GDQjpM#W#W";
 static const char* kImpMemcpy  = "Q3VBxCXhUHs#W#W";
+// [7.7.2] Опознаны по поведению (tools/scan3.c):
+//   PLT[192] 8zTFvBIAIN8 = memset(dst, val, n)  — alloc+zero хелпер: (ptr, 0, len)
+//   PLT[222] +P6FRGH4LfA = memmove(dst, src, n) — сдвиг записей таблицы на 16Б
+//     (lea rdi,[r12+r15+0x10]; lea rsi,[r12+r15]; rdx=count*16), и сдвиги массива.
+static const char* kImpMemset  = "8zTFvBIAIN8#W#W";
+static const char* kImpMemmove = "+P6FRGH4LfA#W#W";
 
 // Фаза 7.6: последняя надежда. Сюда попадают исключения, которые не перехватил
 // VEH (чужие нити, код вне гостя). Раньше они убивали процесс МОЛЧА — без
@@ -504,6 +551,8 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                     res = HeapAllocAligned(16, a[0], "malloc");
                 }
                 else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(c, a[0], a[1], a[2]);
+                else if (!std::strcmp(sym, kImpMemset))  res = HeapMemset(c, a[0], a[1], a[2]);
+                else if (!std::strcmp(sym, kImpMemmove)) res = HeapMemmove(c, a[0], a[1], a[2]);
                 else hit = false;
                 if (hit) {
                     static std::atomic<uint32_t> nH{0};
