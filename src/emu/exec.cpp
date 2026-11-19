@@ -461,8 +461,14 @@ static uint64_t HeapAllocAligned(uint64_t align, uint64_t n, const char* what) {
     }
     std::lock_guard<std::mutex> lk(g_heapMx);
     const uint64_t payload = (n + 0xF) & ~0xFull;
-    uint64_t start = (g_heapOff + align - 1) & ~(align - 1);
-    if (start < 16) start = align;      // под заголовок (ptr-16) нужно место
+    // [7.7.5] Заголовок {size, magic} живёт в 16 байтах ПЕРЕД блоком, поэтому
+    // сначала резервируем эти 16 байт и только потом выравниваем начало.
+    // Раньше start = align_up(g_heapOff), и заголовок нового блока затирал
+    // ПОСЛЕДНИЕ 16 байт предыдущего блока. Dead Cells растил вектор
+    // инициализаторов через malloc+memcpy+free: заголовок {0x200,'KXRZ'} попал
+    // в хвост буфера, скопировался по цепочке роста и стал записью [30] списка
+    // 0x24C2140 — оттуда краш 0x1A2C9D3 по адресу 0x200.
+    uint64_t start = (g_heapOff + 16 + align - 1) & ~(align - 1);
     const uint64_t end  = start + payload;
     if (n > (512ull << 20) || end > g_heapCap) {
         printf("[7.6] %s: ОТКАЗ size=0x%llX align=0x%llX (off=0x%llX) — верну 0\n",

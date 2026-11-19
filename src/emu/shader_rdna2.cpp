@@ -112,7 +112,7 @@ static bool InlineInt(uint32_t code, int64_t* v) {
 // порядок логической раскладки не нарушается.
 // ============================================================================
 struct Builder {
-    std::vector<uint32_t> pre, fn;
+    std::vector<uint32_t> dec, pre, fn;      // dec: аннотации; pre: типы/константы; fn: тело
     uint32_t next = 1;                       // id counter (bound = next)
     // типы
     uint32_t tVoid = 0, tF32 = 0, tI32 = 0, tU32 = 0, tV4 = 0, tFn = 0;
@@ -178,7 +178,13 @@ struct Builder {
         return r;
     }
     void declare(uint32_t var, uint32_t decoration, uint32_t value) {
-        emitPre(SPV_OpDecorate, { var, decoration, value });
+        // [5.3.1] Логическая раскладка SPIR-V: все OpDecorate обязаны идти
+        // ДО типов/констант/глобальных переменных. Раньше аннотации попадали
+        // в pre между OpType*, spirv-val говорил "Decorate is in an invalid
+        // layout section"; NVIDIA молча принимал модуль, но треугольник не
+        // рисовался. Держим аннотации отдельным потоком.
+        std::vector<uint32_t> ops = { var, decoration, value };
+        emit(dec, SPV_OpDecorate, ops.data(), ops.size());
     }
     // Глобальные переменные + типы указателей + функция — сразу при старте.
     void init(bool vertex) {
@@ -244,6 +250,7 @@ struct Builder {
             emit(head, SPV_OpExecutionMode, em, 2);
         }
         for (uint32_t w : head) out->push_back(w);
+        for (uint32_t w : dec)  out->push_back(w);
         for (uint32_t w : pre)  out->push_back(w);
         for (uint32_t w : fn)   out->push_back(w);
     }
