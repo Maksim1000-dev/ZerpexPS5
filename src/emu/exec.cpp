@@ -607,6 +607,99 @@ static const char* kImpMemcpy  = "Q3VBxCXhUHs#W#W";
 //     (lea rdi,[r12+r15+0x10]; lea rsi,[r12+r15]; rdx=count*16), и сдвиги массива.
 static const char* kImpMemset  = "8zTFvBIAIN8#W#W";
 static const char* kImpMemmove = "+P6FRGH4LfA#W#W";
+// [7.7.6] PLT[236] hcuQgD53UxM = printf-подобный вывод. Опознан по вызову из
+// фатального репортера 0x1A30980: (fmt="%s(%d) : FATAL ERROR : %s\n",
+// file=...\hashlink\src\alloc.c, line=0x1A9, msg). Без него причина смерти
+// hashlink-аллокатора не видна в логе вообще.
+static const char* kImpPrintf = "hcuQgD53UxM#W#W";
+// [7.7.7] libkernel: прямое отображение памяти (PS5).
+// Обёртка гостя 0x1B3BBB0(size, align) делает три вызова подряд:
+//   pO96TwzOm5E                              -> размер прямой памяти
+//   rTXw65xmLIA(start, len, size, align, type, &phys) -> выделить, вернуть физ. смещение
+//   L-Q3LEjIbgA(&addr, size, prot, flags, phys, align) -> отобразить в VA
+// Первый вызов идёт с addr=8: это сентинел "адрес выбирает ядро". Раньше все
+// три возвращали 0, и обёртка считала mmap успешным по адресу 8 — хешлинк
+// писал метаданные страниц в никуда и падал "Out of Memory (pages)"
+// (hashlink alloc.c:425). Теперь L-Q3 реально коммитит страницы VirtualAlloc'ом.
+static const char* kImpDmemSize  = "pO96TwzOm5E#V#P";
+static const char* kImpDmemAlloc = "rTXw65xmLIA#V#P";
+static const char* kImpDmemMap   = "L-Q3LEjIbgA#V#P";
+
+static constexpr uint64_t kDmemTotal = 8ull << 30;   // 8 ГиБ "прямой" памяти
+static std::mutex g_dmMx;
+static uint64_t g_dmPhysNext = 0x10000;              // физ. смещения — синтетика
+struct DmRange { uint64_t base, size; };
+static std::vector<DmRange> g_dmRanges;
+
+static bool DmMapped(uint64_t a, uint64_t n) {
+    for (const DmRange& r : g_dmRanges)
+        if (a >= r.base && a + n <= r.base + r.size) return true;
+    return false;
+}
+
+// Возврат: 0 — успех, -1 — ошибка (гость проверяет знак eax).
+static uint64_t DmMap(uint64_t addrOut, uint64_t len) {
+    if (!addrOut || !len) return (uint64_t)-1;
+    uint64_t* out = (uint64_t*)HostPtr(addrOut, 8, true);
+    if (!out) return (uint64_t)-1;
+    const uint64_t need = (len + 0xFFFF) & ~0xFFFFull;
+    std::lock_guard<std::mutex> lk(g_dmMx);
+    const uint64_t want = *out;
+    const bool sane = want >= 0x100000000ull && (want & 0xFFFFull) == 0;
+    if (sane && DmMapped(want, need)) { *out = want; return 0; }
+    void* p = sane ? VirtualAlloc((void*)(uintptr_t)want, need,
+                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                   : nullptr;
+    if (!p) {
+        p = VirtualAlloc(nullptr, need, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!p) return (uint64_t)-1;
+        *out = (uint64_t)(uintptr_t)p;              // ядро выбрало адрес
+    }
+    g_dmRanges.push_back({ (uint64_t)(uintptr_t)p, need });
+    return 0;
+}
+
+// Мини-формат для гостевых строк: %s %d %i %u %x %X %p %c %%. Ширина/точность
+// и length-модификаторы пропускаются. Адреса гостя = адреса хоста (identity),
+// поэтому %s читается через HostPtr с проверкой диапазона.
+static std::string GuestFormat(uint64_t fmt, const uint64_t* a) {
+    std::string out;
+    const char* f = (const char*)HostPtr(fmt, 1, false);
+    if (!f) return out;
+    int ai = 0;
+    for (const char* p = f; *p; ++p) {
+        if (*p != '%') { out.push_back(*p); continue; }
+        ++p;
+        if (!*p) break;
+        if (*p == '%') { out.push_back('%'); continue; }
+        while (*p && strchr("-+ #0123456789.hlLzjt", *p)) ++p;
+        const char conv = *p;
+        if (!conv) break;
+        const uint64_t v = (ai < 8) ? a[ai++] : 0;
+        char tmp[80];
+        switch (conv) {
+            case 's': {
+                const char* s = v ? (const char*)HostPtr(v, 1, false) : nullptr;
+                out += s ? std::string(s, strnlen(s, 4096)) : std::string("(null)");
+                break;
+            }
+            case 'c': out.push_back((char)v); break;
+            case 'd': case 'i':
+                snprintf(tmp, sizeof(tmp), "%lld", (long long)v); out += tmp; break;
+            case 'u':
+                snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)v); out += tmp; break;
+            case 'x':
+                snprintf(tmp, sizeof(tmp), "%llx", (unsigned long long)v); out += tmp; break;
+            case 'X':
+                snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)v); out += tmp; break;
+            case 'p':
+                snprintf(tmp, sizeof(tmp), "0x%llX", (unsigned long long)v); out += tmp; break;
+            default:
+                out.push_back('%'); out.push_back(conv); break;
+        }
+    }
+    return out;
+}
 
 // Фаза 7.6: последняя надежда. Сюда попадают исключения, которые не перехватил
 // VEH (чужие нити, код вне гостя). Раньше они убивали процесс МОЛЧА — без
@@ -723,6 +816,39 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 c->Rip += 2;             // ud2 — 2 байта; дальше в слоте стоит ret
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            // [7.7.7] Трио прямой памяти (mmap-подобное) — ДО кучи и libc:
+            // оно нужно самому хешлинку для страниц GC, а не libc.
+            if (sym && (!std::strcmp(sym, kImpDmemSize) ||
+                        !std::strcmp(sym, kImpDmemAlloc) ||
+                        !std::strcmp(sym, kImpDmemMap))) {
+                uint64_t a[8];
+                ReadGuestArgs(c, a);
+                uint64_t res = (uint64_t)-1;
+                if (!std::strcmp(sym, kImpDmemSize)) {
+                    res = kDmemTotal;
+                } else if (!std::strcmp(sym, kImpDmemAlloc)) {
+                    uint64_t* phys = (uint64_t*)HostPtr(a[5], 8, true);
+                    if (phys) {
+                        std::lock_guard<std::mutex> lk(g_dmMx);
+                        const uint64_t sz = (a[2] + 0xFFFF) & ~0xFFFFull;
+                        *phys = g_dmPhysNext;            // физ. адрес — фикция
+                        g_dmPhysNext += sz ? sz : 0x10000;
+                        res = 0;
+                    }
+                } else {
+                    res = DmMap(a[0], a[1]);
+                }
+                TraceImport(c, sym, a, res, true);
+                static std::atomic<uint32_t> nDm{0};
+                if (nDm.fetch_add(1) < 12)
+                    printf("[EXEC] libkernel %s(0x%llX, 0x%llX, 0x%llX) -> 0x%llX\n",
+                           sym, (unsigned long long)a[0], (unsigned long long)a[1],
+                           (unsigned long long)a[2], (unsigned long long)res);
+                fflush(stdout);
+                c->Rax = (DWORD64)res;
+                c->Rip += 2;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             // Фаза 7.6: нормальные обработчики libc-импортов (опознаны по
             // поведению вызовов; полная карта PLT->имя: tools/import_map.txt).
             if (sym && g_heapHost == nullptr && g_mem) HeapInit(*g_mem);
@@ -743,6 +869,13 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 else if (!std::strcmp(sym, kImpMemcpy))  res = HeapMemmove(c, a[0], a[1], a[2]);
                 else if (!std::strcmp(sym, kImpMemset))  res = HeapMemset(c, a[0], a[1], a[2]);
                 else if (!std::strcmp(sym, kImpMemmove)) res = HeapMemmove(c, a[0], a[1], a[2]);
+                else if (!std::strcmp(sym, kImpPrintf)) {
+                    const std::string msg = GuestFormat(a[0], a + 1);
+                    printf("[EXEC] guest printf: %s", msg.c_str());
+                    if (msg.empty() || msg.back() != '\n') printf("\n");
+                    fflush(stdout);
+                    res = msg.size();
+                }
                 else hit = false;
                 if (hit) {
                     TraceImport(c, sym, a, res, true);
