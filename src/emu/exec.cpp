@@ -353,6 +353,27 @@ static void ReadGuestArgs(PCONTEXT c, uint64_t args[8]) {
     }
 }
 
+// Аргументы обычного гостевого вызова SysV x64: rdi,rsi,rdx,rcx,r8,r9;
+// хвост на стеке. ВАЖНО: у syscall 4-й аргумент в r10 (rcx съедает syscall),
+// а у обычной функции — в rcx. Раньше libc/импорты читались syscall-набором,
+// из-за чего printf("%s(%d) : ... %s", file, line, msg) терял msg.
+static void ReadCallArgs(PCONTEXT c, uint64_t args[8]) {
+    args[0] = c->Rdi;
+    args[1] = c->Rsi;
+    args[2] = c->Rdx;
+    args[3] = c->Rcx;
+    args[4] = c->R8;
+    args[5] = c->R9;
+    args[6] = 0;
+    args[7] = 0;
+    if (g_mem) {
+        const uint8_t* s1 = g_mem->Ptr(c->Rsp + 8);
+        const uint8_t* s2 = g_mem->Ptr(c->Rsp + 16);
+        if (s1) memcpy(&args[6], s1, 8);
+        if (s2) memcpy(&args[7], s2, 8);
+    }
+}
+
 // --- GPU-работник: Vulkan живёт НЕ в VEH-нити --------------------------------
 // Гость зовёт GPU-импорт из VEH (ud2 -> обработчик исключения). Драйверы
 // (nvoglv64 и т.п.) не рассчитаны на вызов из контекста обработки исключения:
@@ -809,7 +830,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             // обработки исключения драйверам делать нечего (см. GpuJob выше).
             if (sym && gpu::Handles(sym)) {
                 uint64_t gargs[8];
-                ReadGuestArgs(c, gargs);
+                ReadCallArgs(c, gargs);
                 const uint64_t gres = (uint64_t)GpuExecuteOffVeh(sym, gargs);
                 TraceImport(c, sym, gargs, gres, true);
                 c->Rax = (DWORD64)gres;
@@ -822,7 +843,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                         !std::strcmp(sym, kImpDmemAlloc) ||
                         !std::strcmp(sym, kImpDmemMap))) {
                 uint64_t a[8];
-                ReadGuestArgs(c, a);
+                ReadCallArgs(c, a);
                 uint64_t res = (uint64_t)-1;
                 if (!std::strcmp(sym, kImpDmemSize)) {
                     res = kDmemTotal;
@@ -855,7 +876,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             if (sym && g_heapHost) {
                 uint64_t a[8];
                 t_bailed = false;    // 7.7: флаг "выход оформлен" живёт один вызов
-                ReadGuestArgs(c, a);
+                ReadCallArgs(c, a);
                 uint64_t res = 0;
                 bool hit = true;
                 if      (!std::strcmp(sym, kImpMalloc))  res = HeapAllocAligned(16, a[0], "malloc");
@@ -913,7 +934,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 fflush(stdout);
             }
             uint64_t ua[8];
-            ReadGuestArgs(c, ua);
+            ReadCallArgs(c, ua);
             c->Rax = 0;
             TraceImport(c, sym ? sym : "?", ua, 0, false);
             c->Rip += 2;
