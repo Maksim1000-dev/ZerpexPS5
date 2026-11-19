@@ -45,6 +45,10 @@ void AttachMemory(Memory* mem);
 // Пусто = не задан, файлы гостя тогда не открываются (честный ENOENT).
 void SetGameRoot(const std::wstring& root);
 
+// [7.8] Тот же маппинг путей, что у syscalls: нужен HLE stdio (fopen и т.п.),
+// которые гость зовёт как импорты libc, а не через syscall.
+bool MapGuestPath(const char* guest, std::wstring* out);
+
 // Выполнить syscall:
 //   args[0..5] = rdi, rsi, rdx, r10, r8, r9  (FreeBSD x64)
 //   args[6..7] = хвост аргументов со стека гостя (rsp+8, rsp+16)

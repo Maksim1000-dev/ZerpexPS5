@@ -318,6 +318,11 @@ static bool MapPath(const char* guest, std::wstring* out) {
     return false;   // прочие POSIX-пути — честный ENOENT
 }
 
+bool MapGuestPath(const char* guest, std::wstring* out) {
+    if (!guest || !out) return false;
+    return MapPath(guest, out);
+}
+
 // --- Гостевая память: u64 и struct stat (FreeBSD x64) ------------------------
 static void NowRealtime(int64_t* sec, int64_t* nsec);   // определение ниже
 

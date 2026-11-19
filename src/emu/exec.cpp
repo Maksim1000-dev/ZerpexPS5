@@ -646,6 +646,202 @@ static const char* kImpDmemSize  = "pO96TwzOm5E#V#P";
 static const char* kImpDmemAlloc = "rTXw65xmLIA#V#P";
 static const char* kImpDmemMap   = "L-Q3LEjIbgA#V#P";
 
+// [7.8] libc stdio. Гость зовёт их как импорты; опознаны по обёрткам в образе:
+//   0x1A31090 fopen(path, mode) — режимы из таблицы 0x1E80BC0: r,w,a,r+,rb,wb,ab,rb+
+//   0x1A31100 fclose(FILE*)     0x1A31140 fwrite(ptr,1,len,FILE*)  (writeAt)
+//   0x1A311A0 fread(ptr,1,len,FILE*) (readAt)      0x1A31200 fwrite 1 байта,
+//   0x1A31280 fread 1 байта, 0x1A31340 feof. Образец чтения целиком:
+//   0x1A31430 — fopen("rb") + fseek(END) + ftell + fseek(SET) + fread.
+// FILE* у гостя НЕПРОЗРАЧЕН: он только хранит его в Haxe-объекте и возвращает
+// нам же. Поэтому отдаём указатель на нашу структуру в гостевой куче.
+static const char* kImpFopen  = "xeYO4u7uyJ0#W#W";   // PLT[197]
+static const char* kImpFclose = "uodLYyUip20#W#W";   // PLT[200]
+static const char* kImpFwrite = "MpxhMh8QFro#W#W";   // PLT[211] stub 0x1B455B0
+static const char* kImpFflush = "MUjC4lbHrK4#W#W";   // PLT[212]
+static const char* kImpFread  = "lbB+UlZqVG0#W#W";   // PLT[217] stub 0x1B45610
+static const char* kImpFseek  = "rQFVBXp-Cxg#W#W";   // PLT[219]
+static const char* kImpFtell  = "Qazy8LmXTvw#W#W";   // PLT[221]
+static const char* kImpFeof   = "LxcEU+ICu8U#W#W";   // PLT[242]
+// Нерутинные: фатальный обработчик 0x1A30980 зовёт exit(1), а его "смертельный"
+// колбэк по умолчанию — abort-подобный импорт (вызов [0x1EDFFB8] + UD2).
+static const char* kImpExit   = "uMei1W9uyNo#W#W";   // PLT[3]
+static const char* kImpAbort  = "lKEN2IebgJ0#W#W";   // PLT[203]
+
+static constexpr uint32_t kFileMagic = 0x4658525A;   // "ZRXF"
+struct HleFile {
+    uint32_t magic;
+    uint32_t used;
+    HANDLE   h;
+    uint32_t eof;
+    uint32_t err;
+};
+
+static HleFile* FileFromGuest(uint64_t p) {
+    if (!p) return nullptr;
+    HleFile* f = (HleFile*)HostPtr(p, sizeof(HleFile), true);
+    if (!f || f->magic != kFileMagic || !f->used) return nullptr;
+    return f;
+}
+
+// Сколько байт от addr лежит в одном доступном регионе (для больших fread:
+// буфер гостя может пересекать границы VirtualAlloc-регионов).
+static uint64_t GuestWritableChunk(uint64_t addr, uint64_t want) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((LPCVOID)(uintptr_t)addr, &mbi, sizeof(mbi))) return 0;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || mbi.Protect == PAGE_NOACCESS)
+        return 0;
+    const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    uint64_t n = end > addr ? end - addr : 0;
+    return n < want ? n : want;
+}
+
+static uint64_t HleFopen(uint64_t pathA, uint64_t modeA) {
+    const char* path = (const char*)HostPtr(pathA, 1, false);
+    if (!path) return 0;
+    const char* mode = (const char*)HostPtr(modeA, 1, false);
+    if (!mode || !*mode) mode = "rb";
+    std::wstring host;
+    if (!zrx::hle::MapGuestPath(path, &host)) {
+        static std::atomic<uint32_t> nBad{0};
+        if (nBad.fetch_add(1) < 10)
+            printf("[FILE] fopen(\"%s\", \"%s\"): путь не отображён — NULL\n", path, mode);
+        fflush(stdout);
+        return 0;
+    }
+    const bool plus = strchr(mode, '+') != nullptr;
+    DWORD access;
+    DWORD disp;
+    if (*mode == 'w') {
+        access = GENERIC_WRITE | (plus ? GENERIC_READ : 0);
+        disp   = CREATE_ALWAYS;
+    } else if (*mode == 'a') {
+        access = GENERIC_WRITE | (plus ? GENERIC_READ : 0);
+        disp   = OPEN_ALWAYS;
+    } else {
+        access = GENERIC_READ | (plus ? GENERIC_WRITE : 0);
+        disp   = OPEN_EXISTING;
+    }
+    HANDLE h = CreateFileW(host.c_str(), access,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, disp,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        static std::atomic<uint32_t> nErr{0};
+        if (nErr.fetch_add(1) < 20)
+            printf("[FILE] fopen(\"%s\", \"%s\") -> NULL (Win32 %lu, host \"%ls\")\n",
+                   path, mode, (unsigned long)e, host.c_str());
+        fflush(stdout);
+        return 0;
+    }
+    if (*mode == 'a') {
+        LARGE_INTEGER zero{};
+        SetFilePointerEx(h, zero, nullptr, FILE_END);
+    }
+    const uint64_t gp = HeapAllocAligned(16, sizeof(HleFile), "FILE");
+    HleFile* f = gp ? (HleFile*)HostPtr(gp, sizeof(HleFile), true) : nullptr;
+    if (!f) {
+        CloseHandle(h);
+        return 0;
+    }
+    f->magic = kFileMagic;
+    f->used  = 1;
+    f->h     = h;
+    f->eof   = 0;
+    f->err   = 0;
+    static std::atomic<uint32_t> nOpen{0};
+    if (nOpen.fetch_add(1) < 24)
+        printf("[FILE] fopen(\"%s\", \"%s\") -> FILE* 0x%llX\n", path, mode,
+               (unsigned long long)gp);
+    fflush(stdout);
+    return gp;
+}
+
+static uint64_t HleFclose(uint64_t stream) {
+    HleFile* f = FileFromGuest(stream);
+    if (!f) return (uint64_t)-1;
+    f->used = 0;
+    f->magic = 0;
+    CloseHandle(f->h);
+    return 0;
+}
+
+// fread/fwrite: total = size*nmemb, читаем кусками по 1 МиБ; если кусок
+// пересекает границу региона — режем по фактической длине региона.
+static uint64_t HleFread(uint64_t dstA, uint64_t size, uint64_t nmemb, uint64_t stream) {
+    HleFile* f = FileFromGuest(stream);
+    if (!f || !size || !nmemb) return 0;
+    if (size > ~0ull / nmemb) return 0;
+    const uint64_t total = size * nmemb;
+    uint64_t done = 0;
+    while (done < total) {
+        uint64_t want = total - done;
+        if (want > (1ull << 20)) want = 1ull << 20;
+        uint8_t* p = HostPtr(dstA + done, want, true);
+        if (!p) {
+            want = GuestWritableChunk(dstA + done, want);
+            if (!want) { f->err = 1; break; }
+            p = HostPtr(dstA + done, want, true);
+            if (!p) { f->err = 1; break; }
+        }
+        DWORD got = 0;
+        if (!ReadFile(f->h, p, (DWORD)want, &got, nullptr)) { f->err = 1; break; }
+        done += got;
+        if (got < want) { f->eof = 1; break; }
+    }
+    return done / size;
+}
+
+static uint64_t HleFwrite(uint64_t srcA, uint64_t size, uint64_t nmemb, uint64_t stream) {
+    HleFile* f = FileFromGuest(stream);
+    if (!f || !size || !nmemb) return 0;
+    if (size > ~0ull / nmemb) return 0;
+    const uint64_t total = size * nmemb;
+    uint64_t done = 0;
+    while (done < total) {
+        uint64_t want = total - done;
+        if (want > (1ull << 20)) want = 1ull << 20;
+        const uint8_t* p = HostPtr(srcA + done, want, false);
+        if (!p) {
+            want = GuestWritableChunk(srcA + done, want);   // границы регионов те же
+            if (!want) { f->err = 1; break; }
+            p = HostPtr(srcA + done, want, false);
+            if (!p) { f->err = 1; break; }
+        }
+        DWORD wrote = 0;
+        if (!WriteFile(f->h, p, (DWORD)want, &wrote, nullptr)) { f->err = 1; break; }
+        done += wrote;
+        if (wrote < want) break;
+    }
+    return done / size;
+}
+
+static uint64_t HleFseek(uint64_t stream, uint64_t off, uint64_t whence) {
+    HleFile* f = FileFromGuest(stream);
+    if (!f) return (uint64_t)-1;
+    if (whence > 2) return (uint64_t)-1;
+    LARGE_INTEGER li{};
+    li.QuadPart = (LONGLONG)off;
+    const DWORD method = whence == 0 ? FILE_BEGIN : whence == 1 ? FILE_CURRENT : FILE_END;
+    if (!SetFilePointerEx(f->h, li, nullptr, method)) return (uint64_t)-1;
+    f->eof = 0;
+    return 0;
+}
+
+static uint64_t HleFtell(uint64_t stream) {
+    HleFile* f = FileFromGuest(stream);
+    if (!f) return (uint64_t)-1;
+    LARGE_INTEGER zero{}, cur{};
+    if (!SetFilePointerEx(f->h, zero, &cur, FILE_CURRENT)) return (uint64_t)-1;
+    return (uint64_t)cur.QuadPart;
+}
+
+static uint64_t HleFeof(uint64_t stream) {
+    HleFile* f = FileFromGuest(stream);
+    return (!f || f->eof) ? 1 : 0;
+}
+
+
 static constexpr uint64_t kDmemTotal = 8ull << 30;   // 8 ГиБ "прямой" памяти
 static std::mutex g_dmMx;
 static uint64_t g_dmPhysNext = 0x10000;              // физ. смещения — синтетика
@@ -870,6 +1066,21 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 c->Rip += 2;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            // [7.8] Нерутинные libc-импорты: фатальный обработчик зовёт exit(1),
+            // а его колбэк по умолчанию — abort-подобный импорт. Оформляем
+            // штатный выход; без этого noreturn-слот UD2 убивал процесс молча.
+            if (sym && (!std::strcmp(sym, kImpExit) || !std::strcmp(sym, kImpAbort))) {
+                uint64_t a[8];
+                ReadCallArgs(c, a);
+                const bool isExit = !std::strcmp(sym, kImpExit);
+                const int code = isExit ? (int)a[0] : 1;
+                printf("[EXEC] guest %s(%d) — завершаю прогон штатно\n",
+                       isExit ? "exit" : "abort", code);
+                fflush(stdout);
+                t_exitCode = code;
+                if (t_bailPtr) return BailPatchContext(c, JMPL_EXIT);
+                ExitProcess((UINT)code);
+            }
             // Фаза 7.6: нормальные обработчики libc-импортов (опознаны по
             // поведению вызовов; полная карта PLT->имя: tools/import_map.txt).
             if (sym && g_heapHost == nullptr && g_mem) HeapInit(*g_mem);
@@ -897,6 +1108,14 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                     fflush(stdout);
                     res = msg.size();
                 }
+                else if (!std::strcmp(sym, kImpFopen))  res = HleFopen(a[0], a[1]);
+                else if (!std::strcmp(sym, kImpFclose)) res = HleFclose(a[0]);
+                else if (!std::strcmp(sym, kImpFread))  res = HleFread(a[0], a[1], a[2], a[3]);
+                else if (!std::strcmp(sym, kImpFwrite)) res = HleFwrite(a[0], a[1], a[2], a[3]);
+                else if (!std::strcmp(sym, kImpFseek))  res = HleFseek(a[0], a[1], a[2]);
+                else if (!std::strcmp(sym, kImpFtell))  res = HleFtell(a[0]);
+                else if (!std::strcmp(sym, kImpFeof))   res = HleFeof(a[0]);
+                else if (!std::strcmp(sym, kImpFflush)) res = 0;
                 else hit = false;
                 if (hit) {
                     TraceImport(c, sym, a, res, true);
