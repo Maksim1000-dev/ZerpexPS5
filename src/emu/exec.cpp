@@ -667,6 +667,31 @@ static const char* kImpFeof   = "LxcEU+ICu8U#W#W";   // PLT[242]
 static const char* kImpExit   = "uMei1W9uyNo#W#W";   // PLT[3]
 static const char* kImpAbort  = "lKEN2IebgJ0#W#W";   // PLT[203]
 
+// [7.9] Импорты, звавшиеся в логе 0.8.5 как заглушки; опознаны по коду гостя
+// (tools/q_*.asm, z_*.asm), а не по именам:
+//   PLT[233] kiZSXIWd9vg = strcat(dst, src). Обёртка пути 0x1A55C50 кладёт в
+//     0x24C68D0 строку "/app0/" и зовёт strcat(dst=0x24C68D6, там NUL, src=путь),
+//     т.е. дописывает путь В КОНЕЦ. Заглушка ничего не писала — fopen получал
+//     "/app0/", открывался КАТАЛОГ, fread давал Eof и Haxe падал SysError.
+//   PLT[250] tcVi5SivF7Q = sprintf(dst, fmt, ...): 0x1A557F2 зовёт с
+//     (buf, fmt, код символа), возврат = длина; Haxe гонит UTF-8 -> UTF-16.
+//   PLT[201] 5TjaJwkLWxE = memcmp(a, b, n) — скан таблиц блоками по 0x100.
+//   PLT[237] wLlFkwG9UcQ = time(t): 0x1A305F0 = "xor edi,edi; jmp PLT[237]".
+//   PLT[152] HoLVWNanBBc = getpid-подобный источник энтропии для сида RNG.
+//   PLT[287] ejekcaNQNq0 = gettimeofday(tv, tz): 0x1B3C160 tail-jmp на PLT[287].
+//   PLT[303] 3GPpjQdAMTw = __cxa_guard_acquire. Возврат 0 значит "уже
+//     инициализировано", из-за чего статическая инициализация (0x1B41510)
+//     пропускалась целиком.
+//   PLT[304] 9rAeANT2tyE = __cxa_guard_release: помечает guard завершённым.
+static const char* kImpStrcat   = "kiZSXIWd9vg#W#W";     // PLT[233]
+static const char* kImpSprintf  = "tcVi5SivF7Q#W#W";     // PLT[250]
+static const char* kImpMemcmp   = "5TjaJwkLWxE#W#W";     // PLT[201]
+static const char* kImpTime     = "wLlFkwG9UcQ#W#W";     // PLT[237]
+static const char* kImpGetPid   = "HoLVWNanBBc#O#P";     // PLT[152]
+static const char* kImpGettimeofday = "ejekcaNQNq0#V#P"; // PLT[287]
+static const char* kImpGuardAcq = "3GPpjQdAMTw#W#W";     // PLT[303]
+static const char* kImpGuardRel = "9rAeANT2tyE#W#W";     // PLT[304]
+
 static constexpr uint32_t kFileMagic = 0x4658525A;   // "ZRXF"
 struct HleFile {
     uint32_t magic;
@@ -721,10 +746,12 @@ static uint64_t HleFopen(uint64_t pathA, uint64_t modeA) {
         access = GENERIC_READ | (plus ? GENERIC_WRITE : 0);
         disp   = OPEN_EXISTING;
     }
+    // Без FILE_FLAG_BACKUP_SEMANTICS: каталог НЕ должен открываться как файл.
+    // В 0.8.5 из-за заглушки strcat путь был "/app0/", CreateFileW "успешно"
+    // открывал папку, а fread отдавал Eof — ошибка маскировалась под чтение.
     HANDLE h = CreateFileW(host.c_str(), access,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, disp,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                           nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD e = GetLastError();
         static std::atomic<uint32_t> nErr{0};
@@ -918,6 +945,121 @@ static std::string GuestFormat(uint64_t fmt, const uint64_t* a) {
     return out;
 }
 
+// [7.9] Длина гостевой строки с проверкой КАЖДОГО байта через HostPtr: пути и
+// таблицы лежат у границ отображённых регионов, читать до NUL вслепую нельзя.
+static uint64_t GuestStrlen(uint64_t a, uint64_t maxLen) {
+    if (!a) return ~0ull;
+    for (uint64_t i = 0; i < maxLen; ++i) {
+        const char* p = (const char*)HostPtr(a + i, 1, false);
+        if (!p) return ~0ull;
+        if (!*p) return i;
+    }
+    return ~0ull;
+}
+
+// strcat(dst, src): обёртка пути 0x1A55C50 передаёт dst = указатель на NUL
+// (конец "/app0/"), поэтому просто дописываем src в конец.
+static uint64_t GuestStrcat(uint64_t dstA, uint64_t srcA) {
+    const uint64_t dl = GuestStrlen(dstA, 1ull << 20);
+    const uint64_t sl = GuestStrlen(srcA, 1ull << 20);
+    if (dl == ~0ull || sl == ~0ull) return 0;
+    char* d = (char*)HostPtr(dstA + dl, sl + 1, true);
+    const char* s = (const char*)HostPtr(srcA, sl + 1, false);
+    if (!d || !s) return 0;
+    memmove(d, s, (size_t)(sl + 1));
+    static std::atomic<uint32_t> nCat{0};
+    if (nCat.fetch_add(1) < 8) {
+        const char* base = (const char*)HostPtr(dstA, dl + 1, false);
+        printf("[FILE] strcat: \"%s\" + \"%s\"\n", base ? base : "?", s);
+        fflush(stdout);
+    }
+    return dstA;
+}
+
+// memcmp(a, b, n) кусками по фактическим границам регионов (гость может
+// сравнивать блок, лежащий на стыке двух VirtualAlloc-регионов).
+static uint64_t GuestMemcmp(uint64_t aA, uint64_t bA, uint64_t n) {
+    uint64_t done = 0;
+    int r = 0;
+    while (done < n) {
+        const uint64_t want = n - done;
+        const uint64_t ca = GuestWritableChunk(aA + done, want);
+        const uint64_t cb = GuestWritableChunk(bA + done, want);
+        const uint64_t k = ca < cb ? ca : cb;
+        if (!k) return 0;
+        const uint8_t* x = (const uint8_t*)HostPtr(aA + done, k, false);
+        const uint8_t* y = (const uint8_t*)HostPtr(bA + done, k, false);
+        if (!x || !y) return 0;
+        r = memcmp(x, y, (size_t)k);
+        if (r) break;
+        done += k;
+    }
+    return (uint64_t)(int64_t)r;
+}
+
+// sprintf(dst, fmt, ...): GuestFormat + запись в гостевой буфер. Возврат —
+// число байт без NUL, как у настоящего sprintf.
+static uint64_t GuestSprintf(uint64_t dstA, uint64_t fmtA, const uint64_t* va) {
+    const std::string s = GuestFormat(fmtA, va);
+    char* d = (char*)HostPtr(dstA, s.size() + 1, true);
+    if (!d) return (uint64_t)-1;
+    memcpy(d, s.c_str(), s.size() + 1);
+    static std::atomic<uint32_t> nSp{0};
+    if (nSp.fetch_add(1) < 6) {
+        const char* f = (const char*)HostPtr(fmtA, 1, false);
+        printf("[EXEC] sprintf: fmt=\"%s\" -> \"%s\" (%zu)\n",
+               f ? f : "?", s.c_str(), s.size());
+        fflush(stdout);
+    }
+    return (uint64_t)s.size();
+}
+
+// time(t): секунды Unix. PS5/FreeBSD time_t — 64 бита.
+static uint64_t GuestTime(uint64_t outA) {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    const uint64_t t100 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    const int64_t t = (int64_t)(t100 / 10000000ull) - 11644473600ll;
+    if (outA) {
+        int64_t* p = (int64_t*)HostPtr(outA, 8, true);
+        if (p) *p = t;
+    }
+    return (uint64_t)t;
+}
+
+// gettimeofday(struct timeval { int64 tv_sec; int64 tv_usec; }, tz)
+static uint64_t GuestGetTimeOfDay(uint64_t tvA, uint64_t tzA) {
+    (void)tzA;
+    int64_t* tv = (int64_t*)HostPtr(tvA, 16, true);
+    if (!tv) return (uint64_t)-1;
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    const uint64_t t100 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    tv[0] = (int64_t)(t100 / 10000000ull) - 11644473600ll;   // секунды
+    tv[1] = (int64_t)((t100 % 10000000ull) / 10ull);         // микросекунды
+    return 0;
+}
+
+static uint64_t GuestGetPid() {
+    return (uint64_t)GetCurrentProcessId();
+}
+
+// __cxa_guard_acquire/release. Гость пока однопоточный, поэтому acquire честно
+// отвечает 1 (инициализацию выполняет этот поток), release ставит guard=2.
+// Раньше заглушка возвращала 0 = "уже инициализировано" и init пропускался.
+static uint64_t GuestGuardAcquire(uint64_t guardA) {
+    uint8_t* g = (uint8_t*)HostPtr(guardA, 1, true);
+    if (!g || *g) return 0;
+    *g = 1;
+    return 1;
+}
+
+static uint64_t GuestGuardRelease(uint64_t guardA) {
+    uint8_t* g = (uint8_t*)HostPtr(guardA, 1, true);
+    if (g) *g = 2;
+    return 0;
+}
+
 // Фаза 7.6: последняя надежда. Сюда попадают исключения, которые не перехватил
 // VEH (чужие нити, код вне гостя). Раньше они убивали процесс МОЛЧА — без
 // итога в логе. Теперь: диагноз в лог, потом цепочка к фильтру из main.cpp.
@@ -1085,7 +1227,9 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
             // поведению вызовов; полная карта PLT->имя: tools/import_map.txt).
             if (sym && g_heapHost == nullptr && g_mem) HeapInit(*g_mem);
             if (sym && g_heapHost) {
-                uint64_t a[8];
+                // [7.9] 16 слотов: sprintf получает хвост varargs через a+2,
+                // GuestFormat читает до 8 значений — за пределами массива не идём.
+                uint64_t a[16] = {};
                 t_bailed = false;    // 7.7: флаг "выход оформлен" живёт один вызов
                 ReadCallArgs(c, a);
                 uint64_t res = 0;
@@ -1116,6 +1260,14 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 else if (!std::strcmp(sym, kImpFtell))  res = HleFtell(a[0]);
                 else if (!std::strcmp(sym, kImpFeof))   res = HleFeof(a[0]);
                 else if (!std::strcmp(sym, kImpFflush)) res = 0;
+                else if (!std::strcmp(sym, kImpStrcat)) res = GuestStrcat(a[0], a[1]);
+                else if (!std::strcmp(sym, kImpSprintf)) res = GuestSprintf(a[0], a[1], a + 2);
+                else if (!std::strcmp(sym, kImpMemcmp)) res = GuestMemcmp(a[0], a[1], a[2]);
+                else if (!std::strcmp(sym, kImpTime))   res = GuestTime(a[0]);
+                else if (!std::strcmp(sym, kImpGetPid)) res = GuestGetPid();
+                else if (!std::strcmp(sym, kImpGettimeofday)) res = GuestGetTimeOfDay(a[0], a[1]);
+                else if (!std::strcmp(sym, kImpGuardAcq)) res = GuestGuardAcquire(a[0]);
+                else if (!std::strcmp(sym, kImpGuardRel)) res = GuestGuardRelease(a[0]);
                 else hit = false;
                 if (hit) {
                     TraceImport(c, sym, a, res, true);
