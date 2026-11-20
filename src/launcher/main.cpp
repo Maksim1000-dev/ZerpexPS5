@@ -1,9 +1,12 @@
 // ============================================================================
-// ZerpexPS5 — Launcher v0.5 (библиотека игр в стиле PS5)
+// ZerpexPS5 — Launcher v0.6 (библиотека игр в стиле PS5)
 //
 // Что есть:    окно, DX11-рендер, ImGui, PS5-тема, библиотека игр (скан
 //              папок, param.json, обложки через WIC), выбор игры ставит её
 //              обложку на фон, games.json рядом с EXE.
+// Новое v0.6:  кнопки "Открыть лог" и "Папка игры", размер res.pak в шапке,
+//              запоминание последней запущенной игры, запуск по Enter и
+//              двойному клику, версия ядра в интерфейсе.
 // Новое v0.5:  версии ядра и лаунчера — в src/version.h (ядро 0.8.2:
 //              GPU-демо, сплаш "иконка игры + RUNNED WITH ZerpexPS5",
 //              транслятор RDNA2->SPIR-V).
@@ -24,6 +27,7 @@
 // ============================================================================
 
 #include <windows.h>
+#include <shellapi.h>
 #include <objbase.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -84,6 +88,7 @@ static int g_selected = -1;            // выбранная игра (обло�
 static int     g_gpuIndex = -1;            // приоритет видеокарты, -1 = авто
 static char    g_coreArgs[256] = {};       // доп. параметры командной строки ядра
 static wchar_t g_elfPath[MAX_PATH] = {};   // ELF для прямого запуска
+static char    g_lastGame[1024] = {};      // UTF-8 root последней запущенной игры
 static float   g_setAnim = 0.0f;           // анимация панели настроек, 0..1
 static bool    g_setOpen = false;
 static std::vector<std::string> g_gpus;    // имена карт (порядок перечисления Vulkan)
@@ -123,6 +128,63 @@ static std::wstring ExeDir() {
     std::wstring p(buf);
     size_t s = p.find_last_of(L"\\/");
     return s == std::wstring::npos ? std::wstring(L".") : p.substr(0, s);
+}
+
+// Человеческий размер файла — для статуса res.pak в шапке.
+static std::string HumanSize(uint64_t n) {
+    char b[64];
+    if (n >= (1ull << 30))      snprintf(b, sizeof(b), "%.2f GB", (double)n / (double)(1ull << 30));
+    else if (n >= (1ull << 20)) snprintf(b, sizeof(b), "%.1f MB", (double)n / (double)(1ull << 20));
+    else if (n >= 1024)         snprintf(b, sizeof(b), "%.1f KB", (double)n / 1024.0);
+    else                        snprintf(b, sizeof(b), "%llu B", (unsigned long long)n);
+    return b;
+}
+
+// "res.pak 1.96 GB" или "res.pak НЕТ" — быстрый честный статус файлов игры.
+static std::string ResPakStatus(const zrx::Game& g) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    const std::wstring p = g.root + L"\\res.pak";
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad))
+        return "res.pak НЕТ";
+    const uint64_t sz = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    return "res.pak " + HumanSize(sz);
+}
+
+// Шапка рисуется каждый кадр — не дёргаем ФС 60 раз в секунду.
+static const std::string& ResPakStatusCached(const zrx::Game& g) {
+    static std::wstring cachedRoot;
+    static std::string  cachedText;
+    if (cachedRoot != g.root) {
+        cachedRoot = g.root;
+        cachedText = ResPakStatus(g);
+    }
+    return cachedText;
+}
+
+// Открыть папку/файл в проводнике. Для файла — с выделением.
+static void OpenInExplorer(const std::wstring& path, bool select) {
+    if (select && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const std::wstring args = L"/select,\"" + path + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (select) {
+        const size_t s = path.find_last_of(L"\\/");
+        if (s != std::wstring::npos) {
+            ShellExecuteW(nullptr, L"open", path.substr(0, s).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        }
+    }
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void OpenCoreLog() {
+    OpenInExplorer(ExeDir() + L"\\zerpex_log.txt", true);
+}
+
+static void OpenSelectedGameFolder() {
+    if (g_selected >= 0 && g_selected < (int)g_games.size())
+        OpenInExplorer(g_games[(size_t)g_selected].root, false);
 }
 
 // Системный диалог выбора папки (чистый WinAPI/COM, без новых зависимостей)
@@ -210,6 +272,8 @@ static void AddGamesFromFolder(const std::wstring& path) {
         zrx::Log::warn("Игры PS5 не найдены: ищу eboot.bin или sce_sys\\param.json");
 }
 
+static void SaveSettings();   // определена ниже; нужна для запоминания игры
+
 // Запуск ядра: путь ELF/игры + приоритет карты и доп. параметры из настроек
 static void LaunchCorePath(const std::wstring& target) {
     const std::wstring exe = ExeDir() + L"\\ZerpexPS5.exe";
@@ -241,6 +305,11 @@ static void LaunchCore(const zrx::Game& g) {
         zrx::Log::warn("У игры нет eboot — запускать нечего");
         return;
     }
+    const std::string root = ToUtf8(g.root);
+    if (root.size() < sizeof(g_lastGame)) {
+        strcpy_s(g_lastGame, root.c_str());
+        SaveSettings();
+    }
     LaunchCorePath(g.eboot_path);
 }
 
@@ -265,7 +334,8 @@ static void SaveSettings() {
     f << "{\n";
     f << "  \"gpuIndex\": " << g_gpuIndex << ",\n";
     f << "  \"coreArgs\": \"" << esc(g_coreArgs) << "\",\n";
-    f << "  \"elfPath\": \"" << esc(ToUtf8(g_elfPath)) << "\"\n";
+    f << "  \"elfPath\": \"" << esc(ToUtf8(g_elfPath)) << "\",\n";
+    f << "  \"lastGame\": \"" << esc(g_lastGame) << "\"\n";
     f << "}\n";
 }
 
@@ -285,12 +355,12 @@ static void LoadSettings() {
         return atoi(src.c_str() + c + 1);
     };
     auto findStr = [&](const char* key, std::string& out) {
+        out.clear();                       // ключа может не быть в старом settings.json
         const std::string k = std::string("\"") + key + "\"";
         size_t p = src.find(k);
         if (p == std::string::npos) return;
         p = src.find('"', p + k.size());
         if (p == std::string::npos) return;
-        out.clear();
         for (size_t i = p + 1; i < src.size(); ++i) {
             const char c = src[i];
             if (c == '\\' && i + 1 < src.size()) {
@@ -312,6 +382,9 @@ static void LoadSettings() {
     findStr("elfPath", s);
     const std::wstring w = ToWide(s);
     if (w.size() + 1 <= (size_t)MAX_PATH) wcscpy_s(g_elfPath, w.c_str());
+    findStr("lastGame", s);
+    if (s.size() >= sizeof(g_lastGame)) s.resize(sizeof(g_lastGame) - 1);
+    strcpy_s(g_lastGame, s.c_str());
 }
 
 // Честное перечисление видеокарт через vulkan-1.dll (без линковки) — v0.4.
@@ -654,8 +727,9 @@ static void DrawHeader(const ImVec2& disp) {
             if (!meta.empty()) meta += "  ·  ";
             meta += "v" + g.version;
         }
-        if (!meta.empty())
-            dl->AddText(g_font, 16.0f, ImVec2(56, 96), COL_DIM, meta.c_str());
+        if (!meta.empty()) meta += "  ·  ";
+        meta += ResPakStatusCached(g);            // v0.6: видно, есть ли архив
+        dl->AddText(g_font, 16.0f, ImVec2(56, 96), COL_DIM, meta.c_str());
 
         // Статус: честное состояние дампа (фаза 2.5)
         const char* st_text;
@@ -679,7 +753,8 @@ static void DrawHeader(const ImVec2& disp) {
     } else {
         dl->AddRectFilled(ImVec2(30, 34), ImVec2(38, 72), ACCENT, 4.0f);
         dl->AddText(g_font_title, 34.0f, ImVec2(54, 32), COL_WHITE, "ZerpexPS5");
-        dl->AddText(g_font, 15.0f, ImVec2(56, 72), COL_DIM, "LAUNCHER v" ZERPEX_LAUNCHER_VERSION " — БИБЛИОТЕКА");
+        dl->AddText(g_font, 15.0f, ImVec2(56, 72), COL_DIM,
+                    "LAUNCHER v" ZERPEX_LAUNCHER_VERSION " · ЯДРО v" ZERPEX_CORE_VERSION " — БИБЛИОТЕКА");
     }
 
     // «Чип» пользователя справа (как в PS5)
@@ -707,7 +782,7 @@ static void DrawSettingsPanel(const ImVec2& disp) {
     // Плавный выезд: smoothstep поверх линейного времени.
     const float e = g_setAnim * g_setAnim * (3.0f - 2.0f * g_setAnim);
 
-    const float W = 520.0f, H = 560.0f;
+    const float W = 520.0f, H = 620.0f;
     const float top = 88.0f;
     const float px  = disp.x - W * e;
 
@@ -756,7 +831,7 @@ static void DrawSettingsPanel(const ImVec2& disp) {
     dl->AddText(g_font_title, 28.0f, ImVec2(pmin.x + 26.0f, pmin.y + 16.0f),
                 COL_WHITE, "Настройки");
     dl->AddText(g_font, 15.0f, ImVec2(pmin.x + 26.0f, pmin.y + 58.0f),
-                COL_DIM, "ядро ZerpexPS5 · видеокарта · запуск ELF");
+                COL_DIM, "ядро ZerpexPS5 v" ZERPEX_CORE_VERSION " · видеокарта · запуск ELF");
     ImGui::SetCursorScreenPos(ImVec2(pmin.x + W - 26.0f - 32.0f, pmin.y + 16.0f));
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.08f));
@@ -863,6 +938,20 @@ static void DrawSettingsPanel(const ImVec2& disp) {
     }
     ImGui::PopStyleColor(3);
 
+    // --- Диагностика (v0.6): лог ядра и папка выбранной игры ------------------
+    y += 46.0f;                       // кнопки ELF выше нарисованы от текущего y
+    Section("ДИАГНОСТИКА");
+    ImGui::SetCursorScreenPos(ImVec2(pmin.x + 26.0f, y));
+    if (ImGui::Button("Открыть лог ядра", ImVec2(180, 36)))
+        OpenCoreLog();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g_selected < 0);
+    if (ImGui::Button("Папка игры", ImVec2(150, 36)))
+        OpenSelectedGameFolder();
+    ImGui::EndDisabled();
+    y += 40.0f;
+    Hint("zerpex_log.txt лежит рядом с ядром (в build).", COL_DIM);
+
     // Клик мимо панели (когда она раскрыта) — закрыть. Аватарку и выпадающий
     // список комбо не считаем «мимо»: первый сам тогглит, вторая — окно попапа.
     if (g_setAnim >= 0.999f && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
@@ -876,7 +965,7 @@ static void DrawSettingsPanel(const ImVec2& disp) {
 
     // Честный футер
     dl->AddText(g_font, 13.5f, ImVec2(pmin.x + 26.0f, pmin.y + H - 34.0f), COL_DIM,
-                "settings.json рядом с EXE · ядро получает путь, --gpu N и параметры");
+                "settings.json рядом с EXE · ядро v" ZERPEX_CORE_VERSION " получает путь, --gpu N и параметры");
     ImGui::End();
 }
 
@@ -960,11 +1049,18 @@ static void DrawUI() {
 
     for (int i = 0; i < (int)g_games.size(); ++i) {
         if (TileGame(i, ImVec2(x, row_y), tile)) {
-            g_selected = (g_selected == i) ? -1 : i;
-            if (g_selected >= 0)
-                zrx::Log::info("Выбрана игра: %s", g_games[(size_t)i].title.c_str());
-            else
-                zrx::Log::info("Возврат в библиотеку");
+            // v0.6: двойной клик сразу запускает игру (первый клик уже выбрал её)
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                g_selected = i;
+                zrx::Log::info("Запуск двойным кликом: %s", g_games[(size_t)i].title.c_str());
+                LaunchCore(g_games[(size_t)i]);
+            } else {
+                g_selected = (g_selected == i) ? -1 : i;
+                if (g_selected >= 0)
+                    zrx::Log::info("Выбрана игра: %s", g_games[(size_t)i].title.c_str());
+                else
+                    zrx::Log::info("Возврат в библиотеку");
+            }
         }
         x += tile + 20.0f;
     }
@@ -1003,8 +1099,9 @@ static void DrawUI() {
 
     // Подсказка Esc справа над панелью журнала
     {
-        const char* hint = g_selected >= 0 ? "Esc или клик по фону — назад   ·   Esc (ещё раз) — выход"
-                                           : "Esc — выход";
+        const char* hint = g_selected >= 0
+            ? "Enter / двойной клик — запуск   ·   Esc или клик по фону — назад"
+            : "Esc — выход";
         const ImVec2 hs = ImGui::CalcTextSize(hint);
         ImGui::SetCursorPos(ImVec2(disp.x - hs.x - 28.0f, disp.y - bar_h - 36.0f));
         ImGui::TextColored(ImVec4(0.42f, 0.47f, 0.55f, 1.0f), "%s", hint);
@@ -1034,6 +1131,13 @@ static void DrawUI() {
 
     // ---- Панель настроек (поверх всего, выезжает справа) — v0.4 ----
     DrawSettingsPanel(disp);
+
+    // v0.6: Enter запускает выбранную игру (если не открыты настройки/попап)
+    if (g_selected >= 0 && g_selected < (int)g_games.size() && !g_setOpen &&
+        ImGui::IsKeyPressed(ImGuiKey_Enter, false) &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+        LaunchCore(g_games[(size_t)g_selected]);
+    }
 
     // Esc: закрыть настройки / назад из игры / выход из программы
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -1100,7 +1204,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE, LPSTR, int) {
     const int pos_x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
     const int pos_y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
 
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"ZerpexPS5 v" ZERPEX_LAUNCHER_VERSION_W L" — Launcher",
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName,
+                             L"ZerpexPS5 Launcher v" ZERPEX_LAUNCHER_VERSION_W
+                             L" · ядро v" ZERPEX_CORE_VERSION_W,
                              WS_OVERLAPPEDWINDOW, pos_x, pos_y, win_w, win_h,
                              nullptr, nullptr, hinst, nullptr);
     if (!g_hwnd || !InitD3D(g_hwnd)) {
@@ -1126,6 +1232,7 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE, LPSTR, int) {
     g_imgui_ready = true;
 
     zrx::Log::info("ZerpexPS5 Launcher v" ZERPEX_LAUNCHER_VERSION " запущен");
+    zrx::Log::info("Ядро: v" ZERPEX_CORE_VERSION " (ZerpexPS5.exe)");
     zrx::Log::info("Рендер: DirectX 11 + Dear ImGui 1.93");
 
     // Загружаем сохранённую библиотеку
@@ -1139,6 +1246,18 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE, LPSTR, int) {
     EnumerateGpus();
     zrx::Log::info("Видеокарт найдено: %d%s", (int)g_gpus.size(),
                    g_gpuIndex >= 0 ? "  (приоритет выбран в настройках)" : "");
+
+    // v0.6: на старте открыть последнюю запущенную игру (если она ещё в библиотеке)
+    if (g_lastGame[0]) {
+        const std::wstring w = ToWide(g_lastGame);
+        for (int i = 0; i < (int)g_games.size(); ++i) {
+            if (_wcsicmp(g_games[(size_t)i].root.c_str(), w.c_str()) == 0) {
+                g_selected = i;
+                zrx::Log::info("Последняя игра: %s", g_games[(size_t)i].title.c_str());
+                break;
+            }
+        }
+    }
 
     MSG msg = {};
     while (g_running) {

@@ -683,6 +683,14 @@ static const char* kImpAbort  = "lKEN2IebgJ0#W#W";   // PLT[203]
 //     инициализировано", из-за чего статическая инициализация (0x1B41510)
 //     пропускалась целиком.
 //   PLT[304] 9rAeANT2tyE = __cxa_guard_release: помечает guard завершённым.
+//   PLT[140] E6ao34wPw+U = stat(path, struct stat*). Доказательства:
+//     0x1A536B0 кладёт rsi = &buf (rbp-0x88, до канарейки 0x78 байт), зовёт
+//     импорт и возвращает "eax == 0"; 0x1A537C0 после вызова читает
+//     word [buf+8] >> 14 & 1 — это S_IFDIR; Haxe-native "exists" (0xA56BB0)
+//     берёт char* из строки и tail-jmp сюда. В папке игры только res.pak,
+//     а res1.pak отсутствует: заглушка с возвратом 0 врала "файл есть",
+//     и загрузчик падал на fopen(res1.pak).
+static const char* kImpStat     = "E6ao34wPw+U#O#P";     // PLT[140]
 static const char* kImpStrcat   = "kiZSXIWd9vg#W#W";     // PLT[233]
 static const char* kImpSprintf  = "tcVi5SivF7Q#W#W";     // PLT[250]
 static const char* kImpMemcmp   = "5TjaJwkLWxE#W#W";     // PLT[201]
@@ -782,6 +790,80 @@ static uint64_t HleFopen(uint64_t pathA, uint64_t modeA) {
                (unsigned long long)gp);
     fflush(stdout);
     return gp;
+}
+
+// [7.9] stat(path, struct stat*) из libScePosix. Гость (Haxe) использует его
+// как sys.FileSystem.exists: успех = 0, ошибка = -1. Структура — не FreeBSD
+// x64 (у той mode @0x18), а компактная: mode @0x08, nlink @0x0A,
+// uid/gid @0x0C/0x10, rdev @0x14, timespec'ы @0x18/0x28/0x38 по 16 байт,
+// size @0x48, blocks @0x50, blksize @0x58. Смещения проверены по коду
+// 0x1A53720, который переносит поля из буфера в Haxe-объект.
+static uint64_t HleStat(uint64_t pathA, uint64_t bufA) {
+    const char* path = (const char*)HostPtr(pathA, 1, false);
+    if (!path) return (uint64_t)-1;
+    // Внимание: обёртка 0x1A536B0 держит буфер в rbp-0x88, а канарейку —
+    // в rbp-0x10, т.е. под struct stat реально доступно 0x78 байт. memset
+    // на 0x80 затирал канарейку и валил гостью на __stack_chk_fail.
+    uint8_t* p = (uint8_t*)HostPtr(bufA, 0x78, true);
+    if (!p) return (uint64_t)-1;
+
+    std::wstring host;
+    if (!zrx::hle::MapGuestPath(path, &host)) {
+        static std::atomic<uint32_t> nBad{0};
+        if (nBad.fetch_add(1) < 12)
+            printf("[FILE] stat(\"%s\"): путь не отображён -> -1\n", path);
+        fflush(stdout);
+        return (uint64_t)-1;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(host.c_str(), GetFileExInfoStandard, &fad)) {
+        const DWORD e = GetLastError();
+        static std::atomic<uint32_t> nMiss{0};
+        if (nMiss.fetch_add(1) < 24)
+            printf("[FILE] stat(\"%s\") -> -1 (Win32 %lu)\n", path, (unsigned long)e);
+        fflush(stdout);
+        return (uint64_t)-1;
+    }
+
+    memset(p, 0, 0x78);
+    const bool isDir = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    const uint16_t mode = (uint16_t)((isDir ? 0x4000 : 0x8000) | 0644);
+    memcpy(p + 0x08, &mode, 2);
+    const uint16_t nlink = 1;
+    memcpy(p + 0x0A, &nlink, 2);
+    const uint32_t uid = 0, gid = 0, rdev = 0;
+    memcpy(p + 0x0C, &uid, 4);
+    memcpy(p + 0x10, &gid, 4);
+    memcpy(p + 0x14, &rdev, 4);
+
+    auto putTs = [&](size_t off, const FILETIME& ft) {
+        ULARGE_INTEGER u;
+        u.LowPart  = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        const int64_t w100 = (int64_t)u.QuadPart - 116444736000000000LL;
+        const int64_t sec  = w100 / 10000000;
+        const int64_t nsec = (w100 % 10000000) * 100;
+        memcpy(p + off, &sec, 8);
+        memcpy(p + off + 8, &nsec, 8);
+    };
+    putTs(0x18, fad.ftLastAccessTime);
+    putTs(0x28, fad.ftLastWriteTime);
+    putTs(0x38, fad.ftCreationTime);
+
+    const uint64_t size = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    memcpy(p + 0x48, &size, 8);
+    const uint64_t blocks = (size + 511) / 512;
+    memcpy(p + 0x50, &blocks, 8);
+    const uint32_t blksize = 4096;
+    memcpy(p + 0x58, &blksize, 4);
+
+    static std::atomic<uint32_t> nOk{0};
+    if (nOk.fetch_add(1) < 16)
+        printf("[FILE] stat(\"%s\") -> 0 (mode 0x%X, size %llu)\n",
+               path, (unsigned)mode, (unsigned long long)size);
+    fflush(stdout);
+    return 0;
 }
 
 static uint64_t HleFclose(uint64_t stream) {
@@ -1260,6 +1342,7 @@ static LONG NTAPI VehHandler(PEXCEPTION_POINTERS ep) {
                 else if (!std::strcmp(sym, kImpFtell))  res = HleFtell(a[0]);
                 else if (!std::strcmp(sym, kImpFeof))   res = HleFeof(a[0]);
                 else if (!std::strcmp(sym, kImpFflush)) res = 0;
+                else if (!std::strcmp(sym, kImpStat))   res = HleStat(a[0], a[1]);
                 else if (!std::strcmp(sym, kImpStrcat)) res = GuestStrcat(a[0], a[1]);
                 else if (!std::strcmp(sym, kImpSprintf)) res = GuestSprintf(a[0], a[1], a + 2);
                 else if (!std::strcmp(sym, kImpMemcmp)) res = GuestMemcmp(a[0], a[1], a[2]);

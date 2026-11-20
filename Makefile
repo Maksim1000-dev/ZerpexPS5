@@ -14,7 +14,7 @@ CXXFLAGS := -std=c++17 -O2 -m64 -Wall -mfsgsbase -DUNICODE -D_UNICODE \
 
 # --- Лаунчер: оконное приложение (DX11 + ImGui) ---
 LAUNCHER_LDFLAGS := -m64 -mwindows -static -static-libgcc -static-libstdc++
-LAUNCHER_LIBS    := -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -lwindowscodecs -limm32 -lole32 -luuid
+LAUNCHER_LIBS    := -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -lwindowscodecs -limm32 -lole32 -luuid -lshell32
 
 LAUNCHER_SRCS := src/launcher/main.cpp \
                  src/core/log.cpp \
